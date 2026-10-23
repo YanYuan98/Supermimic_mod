@@ -20,6 +20,7 @@ import torch
 import tyro
 from mjlab.utils.lab_api.math import quat_apply, quat_inv, quat_mul, wrap_to_pi, yaw_quat
 
+from supermimic.goal_spec import anchor_mode
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.envs.mdp.motion_library import discover_npz
 from supermimic.eval.benchmark import load_policy_from_checkpoint
@@ -38,7 +39,7 @@ def main(ckpt: Path, npz_dir: Path = Path("data/npz/lafan1"), clips: list[str] |
     args = SuperMimicEnvCfgArgs(
         npz_files=files, num_envs=n, future_frames=cfg["env"]["future_frames"], episode_length_s=1.0e5,
         action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False,
-        sampling_mode="start", record_transitions=False, seed=0, anchor_obs=cfg["env"].get("anchor_obs", False),
+        sampling_mode="start", record_transitions=False, seed=0, anchor_obs=anchor_mode(cfg["env"].get("anchor_obs", False)), goal_features=cfg["env"].get("goal_features", "v1"), self_collision=cfg["env"].get("self_collision", True),
     )
     env = make_env(args, device=device)
     try:

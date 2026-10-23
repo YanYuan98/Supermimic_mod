@@ -73,6 +73,16 @@ def broadcast_params(module: torch.nn.Module, src: int = 0) -> None:
         dist.broadcast(b.data, src=src)
 
 
+@torch.no_grad()
+def allreduce_buffers(module: torch.nn.Module) -> None:
+    """Average floating-point buffers (running normalisers) across ranks so every rank normalises alike."""
+    if world_size() == 1:
+        return
+    for b in module.buffers():
+        if b.is_floating_point():
+            dist.all_reduce(b.data, op=dist.ReduceOp.AVG)
+
+
 def allreduce_mean(x: float) -> float:
     if world_size() == 1:
         return x

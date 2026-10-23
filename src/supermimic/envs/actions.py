@@ -2,8 +2,9 @@
 
 The *clean* policy action stays in ``raw_action`` (so ``last_action`` observations and
 the action-rate penalty see it); Gaussian noise ``eps ~ N(0, std^2)`` is added to the
-normalized action only when computing the executed set-point. ``executed_raw`` exposes
-``a + eps`` for the replay buffer (the world model is fit on executed actions).
+normalized action only when computing the executed set-point, and the noisy action is clamped
+to +-``noisy_action_limit`` (20, as in supermimic_vibed). ``executed_raw`` exposes
+``clamp(a + eps)`` for the replay buffer (the world model is fit on executed actions).
 """
 
 from __future__ import annotations
@@ -33,7 +34,10 @@ class NoisyJointPositionAction(JointPositionAction):
     def process_actions(self, actions: torch.Tensor):
         self._raw_actions[:] = actions
         if self.noise_std > 0:
-            self._executed_raw = self._raw_actions + self.noise_std * torch.randn_like(self._raw_actions)
+            noisy = self._raw_actions + self.noise_std * torch.randn_like(self._raw_actions)
+            # Bound the executed (noisy) action as supermimic_vibed does; the clean action is untouched.
+            lim = self.cfg.noisy_action_limit
+            self._executed_raw = noisy.clamp(-lim, lim) if lim is not None else noisy
         else:
             self._executed_raw = self._raw_actions.clone()
         self._processed_actions = self._executed_raw * self._scale + self._offset
@@ -50,6 +54,7 @@ class NoisyJointPositionAction(JointPositionAction):
 @dataclass(kw_only=True)
 class NoisyJointPositionActionCfg(JointPositionActionCfg):
     noise_std: float = 0.1
+    noisy_action_limit: float | None = 20.0  # clamp of the noisy executed action (normalised units)
 
     def build(self, env: ManagerBasedRlEnv) -> NoisyJointPositionAction:
         return NoisyJointPositionAction(self, env)

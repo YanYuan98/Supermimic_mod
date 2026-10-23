@@ -8,15 +8,9 @@ import torch
 
 from supermimic.data.replay_buffer import StartBatch
 from supermimic.envs.mdp.motion_library import MotionLibrary
-from supermimic.imagination.compiled import REWARD_TERM_NAMES, ImagStep
-from supermimic.policy.nets import Policy
-from supermimic.world_model.heads import ReferenceFrame, analytic_observation, anchor_relative_obs, flatten_history_term_major
+from supermimic.imagination.compiled import REWARD_TERM_NAMES, ImagHeads, ImagStep
+from supermimic.world_model.heads import analytic_observation
 from supermimic.world_model.wm_trainer import reference_at
-from supermimic.world_model.world_model import WorldModel
-
-# Paper Table A.1 sensor noise (uniform half-widths) in the 93-d observation order.
-OBS_NOISE_HALF = torch.tensor([0.01] * 29 + [0.5] * 29 + [0.2] * 3 + [0.05] * 3 + [0.0] * 29)
-ANCHOR_NOISE_HALF = torch.tensor([0.25] * 3 + [0.05] * 6)
 
 
 @dataclass
@@ -26,105 +20,67 @@ class ImagRollout:
     rewards: torch.Tensor  # (H, n)      r_{t+1}
     dhat: torch.Tensor  # (H+1, n)    predicted termination prob of s_t (d_0 = 0)
     survival: torch.Tensor  # (H+1, n)    c_t
-    goals: torch.Tensor  # (H+1, n, 680)
-    e_root: torch.Tensor  # (H+1, n, 4)
+    goals: torch.Tensor  # (H+1, n, goal_dim)
+    crit_feat: torch.Tensor  # (H+1, n, 84) privileged tracking errors (or (…, 4) root errors only)
     frames: torch.Tensor  # (H+1, n)
-    reward_terms: dict  # mean of each reward term over the rollout (diagnostics)
+    reward_terms: dict  # mean of each reward term over the rollout (diagnostics, tensors)
 
 
 def imagine(
-    wm: WorldModel,
-    policy: Policy,
     lib: MotionLibrary,
     start: StartBatch,
     horizon: int,
+    step_fn: ImagStep,
+    heads_fn: ImagHeads,
     future_frames: int = 10,
-    obs_noise: bool = True,
-    step_fn: ImagStep | None = None,
-    anchor_obs: bool = False,
+    goal_features: str = "v1",
 ) -> ImagRollout:
+    """Roll the policy through the world model for ``horizon`` steps from replay-buffer starts.
+
+    Observation noise and the goal's anchor term follow ``step_fn``'s settings.
+    """
     device = start.state.device
     n = start.state.shape[0]
+    H = horizon
+    ai = step_fn.wm.heads.anchor_index
+
+    # Every target frame of the rollout is known up front (frame + t, clamped at the clip end):
+    # gather the references and the reference part of the goals for all steps in one call each.
+    last = lib.last_frame_of(start.frame)
+    frames = torch.minimum(start.frame[None, :] + torch.arange(H + 1, device=device)[:, None], last[None, :])  # (H+1, n)
+    flat_frames = frames.reshape(-1)
+    ref = reference_at(lib, flat_frames)
+    goal_ref = lib.goal_window(flat_frames, future_frames, goal_features).reshape(H + 1, n, -1)
+    anchor_pos = ref.body_pos_w[:, ai].reshape(H + 1, n, 3)
+    anchor_quat = ref.body_quat_w[:, ai].reshape(H + 1, n, 4)
+
+    # Initial observation history from the logged states / actions (noise re-sampled per frame).
     q0 = lib.default_joint_pos
-    step_fn = step_fn or ImagStep(wm, q0)
-    noise_half = OBS_NOISE_HALF.to(device)
-    anchor_noise_half = ANCHOR_NOISE_HALF.to(device)
-    ai = wm.heads.anchor_index
+    hist = torch.stack([step_fn.noisy(analytic_observation(start.hist_states[i], start.hist_actions[i], start.xi, q0)) for i in range(start.hist_states.shape[0])])
 
-    def add_noise(o):
-        if obs_noise:
-            return o + (torch.rand_like(o) * 2 - 1) * noise_half
-        return o
-
-    def make_goal(frame_t, ref_t, anchor_pose):
-        g = lib.goal_window(frame_t, future_frames)
-        if not anchor_obs:
-            return g
-        rel = anchor_relative_obs(anchor_pose[..., 0:3], anchor_pose[..., 3:7], ref_t.body_pos_w[..., ai, :], ref_t.body_quat_w[..., ai, :])
-        if obs_noise:
-            rel = rel + (torch.rand_like(rel) * 2 - 1) * anchor_noise_half
-        return torch.cat([g, rel], dim=-1)
-
-    # Initial observation history from the logged states/actions (noise re-sampled per frame).
-    hist = [add_noise(analytic_observation(start.hist_states[i], start.hist_actions[i], start.xi, q0)) for i in range(start.hist_states.shape[0])]
     s = start.state
-    frame = start.frame.clone()
-    a_prev = start.prev_action
-    c = torch.ones(n, device=device)
-
-    states = [s]
-    actions, rewards = [], []
-    dhats, survivals, frames = [torch.zeros(n, device=device)], [c], [frame]
-    # All target frames of the rollout are known up front (frame + t, clamped at the clip end):
-    # gather / FK the references for every step in one batched call.
-    last = lib.last_frame_of(frame)
-    frames_all = torch.minimum(frame[None, :] + torch.arange(horizon + 1, device=device)[:, None], last[None, :])  # (H+1, n)
-    ref_all = reference_at(lib, frames_all.reshape(-1))
-
-    def ref_at(t):
-        sl = slice(t * n, (t + 1) * n)
-        return ReferenceFrame(ref_all.body_pos_w[sl], ref_all.body_quat_w[sl], ref_all.body_lin_vel_w[sl], ref_all.body_ang_vel_w[sl], ref_all.root_pos_w[sl], ref_all.root_quat_w[sl])
-
-    ref = ref_at(0)
-    if anchor_obs:
-        b0 = wm.heads.robot_bodies(s)
-        anchor_pose = torch.cat([b0["pos"][..., ai, :], b0["quat"][..., ai, :]], dim=-1)
-    else:
-        anchor_pose = None
-    goals = [make_goal(frame, ref, anchor_pose)]
-    e_roots = [wm.heads.root_error_features(s, ref)]
-    term_sum = torch.zeros(len(REWARD_TERM_NAMES), device=device)
-
-    for t in range(horizon):
-        obs_flat = flatten_history_term_major(torch.stack(hist, 0))
-        a = policy(obs_flat, goals[-1])
-        s_next, r, term_vec, logits, obs_clean, anchor_pose = step_fn(s, a, a_prev, start.xi, ref)
-        d = torch.sigmoid(logits)
-        c = c * (1.0 - d)
-        term_sum += term_vec.detach().mean(-1)
-
-        frame = frames_all[t + 1]
-        ref = ref_at(t + 1)
-        hist = hist[1:] + [add_noise(obs_clean)]
-        a_prev = a
-        s = s_next
+    states, actions, goals = [s], [], []
+    for t in range(H):
+        s, a, hist, g = step_fn(s, hist, goal_ref[t], anchor_pos[t], anchor_quat[t], start.xi)
         states.append(s)
         actions.append(a)
-        rewards.append(r)
-        dhats.append(d)
-        survivals.append(c)
-        goals.append(make_goal(frame, ref, anchor_pose))
-        e_roots.append(wm.heads.root_error_features(s, ref))
-        frames.append(frame)
+        goals.append(g)
+    goals.append(step_fn.goal(s, goal_ref[H], anchor_pos[H], anchor_quat[H]))  # g_H for the critic
 
+    states = torch.stack(states)
+    actions = torch.stack(actions)
+    prev_actions = torch.cat([start.prev_action[None], actions[:-1]], dim=0)
+    rewards, term_vec, logits, crit = heads_fn(states, actions, prev_actions, ref)
+    d = torch.sigmoid(logits)  # (H, n) termination probability of s_1..s_H
+    survival = torch.cat([torch.ones(1, n, device=device), torch.cumprod(1.0 - d, dim=0)], dim=0)
     return ImagRollout(
-        states=torch.stack(states),
-        actions=torch.stack(actions),
-        rewards=torch.stack(rewards),
-        dhat=torch.stack(dhats),
-        survival=torch.stack(survivals),
+        states=states,
+        actions=actions,
+        rewards=rewards,
+        dhat=torch.cat([torch.zeros(1, n, device=device), d], dim=0),
+        survival=survival,
         goals=torch.stack(goals),
-        e_root=torch.stack(e_roots),
-        frames=torch.stack(frames),
-        reward_terms={k: float(v / horizon) for k, v in zip(REWARD_TERM_NAMES, term_sum.tolist())},
+        crit_feat=crit,
+        frames=frames,
+        reward_terms={k: v for k, v in zip(REWARD_TERM_NAMES, term_vec.detach().mean(dim=(1, 2)).unbind(0))},
     )

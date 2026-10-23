@@ -30,7 +30,7 @@ def env():
 def test_spaces_and_step(env):
     obs, _ = env.reset()
     assert obs["policy"].shape == (32, 930)
-    assert obs["goal"].shape == (32, 680)
+    assert obs["goal"].shape == (32, 680 + 6)  # default anchor_obs="ori"
     assert env.action_manager.total_action_dim == 29
     for _ in range(40):
         act = 0.3 * torch.randn(32, 29, device=env.device)
@@ -124,3 +124,14 @@ def test_episode_never_crosses_clip_boundary(env):
         obs, rew, term, tout, _ = env.step(torch.zeros(env.num_envs, 29, device=env.device))
         fired = fired or bool(tout[0]) or bool(term[0])
     assert fired
+
+
+def test_noisy_action_clamped_clean_action_kept(env):
+    """The executed (noisy) action is clamped to +-20; the observed / penalised action stays clean."""
+    env.reset()
+    term = env.action_manager.get_term("joint_pos")
+    big = torch.full((32, 29), 100.0, device=env.device)
+    big[:, ::2] = -100.0
+    env.step(big)
+    assert term.executed_raw.abs().max() <= 20.0 + 1e-6
+    torch.testing.assert_close(env.action_manager.action, big)

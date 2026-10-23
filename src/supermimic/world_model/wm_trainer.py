@@ -9,7 +9,7 @@ import torch
 from supermimic.data.replay_buffer import ReplayBuffer, WindowBatch
 from supermimic.envs.mdp.motion_library import MotionLibrary
 from supermimic.world_model.heads import ReferenceFrame
-from supermimic.training.distributed import allreduce_grads
+from supermimic.training.distributed import allreduce_buffers, allreduce_grads
 from supermimic.world_model.world_model import WorldModel
 
 
@@ -27,7 +27,7 @@ class WMTrainerCfg:
 def reference_at(lib: MotionLibrary, frame: torch.Tensor) -> ReferenceFrame:
     r = lib.ref(frame)
     b = lib.bodies(frame)
-    return ReferenceFrame(b.pos_w, b.quat_w, b.lin_vel_w, b.ang_vel_w, r.root_pos_w, r.root_quat_w)
+    return ReferenceFrame(b.pos_w, b.quat_w, b.lin_vel_w, b.ang_vel_w, r.root_pos_w, r.root_quat_w, r.joint_pos)
 
 
 class WorldModelTrainer:
@@ -35,7 +35,7 @@ class WorldModelTrainer:
         self.wm = wm
         self.lib = lib
         self.cfg = cfg
-        self.opt = torch.optim.Adam(wm.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+        self.opt = torch.optim.Adam(wm.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, fused=torch.cuda.is_available())
         wm.enable_compile(cfg.compile)
 
     def set_lr(self, lr: float) -> None:
@@ -46,17 +46,20 @@ class WorldModelTrainer:
         k, n = w.frame.shape
         # Only the root pose of the references is needed for the termination features.
         r = self.lib.ref(w.frame.reshape(-1))
-        refs = [ReferenceFrame(None, None, None, None, r.root_pos_w[j * n : (j + 1) * n], r.root_quat_w[j * n : (j + 1) * n]) for j in range(k)]
-        return self.wm.window_loss(w.states, w.a_exec, w.xi, w.done, refs)
+        return self.wm.window_loss(w.states, w.a_exec, w.xi, w.done, r.root_pos_w.reshape(k, n, 3), r.root_quat_w.reshape(k, n, 4))
 
     def update(self, buffer: ReplayBuffer) -> dict[str, float]:
         agg: dict[str, torch.Tensor] = {}
+        mask = buffer.window_mask(self.cfg.window)  # shared by the batches of this update
         for _ in range(self.cfg.batches_per_update):
-            w = buffer.sample_windows(self.cfg.batch_size, self.cfg.window)
+            w = buffer.sample_windows(self.cfg.batch_size, self.cfg.window, mask=mask)
+            self.wm.update_normalizers(w.states[0], w.a_exec[0], w.xi, w.states[1])
             loss, m = self.loss_on(w)
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
             allreduce_grads(self.wm)
+            if self.wm.running_norm:
+                allreduce_buffers(self.wm)
             gn = torch.nn.utils.clip_grad_norm_(self.wm.parameters(), self.cfg.grad_clip)
             self.opt.step()
             m["loss"] = loss.detach()

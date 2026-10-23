@@ -43,7 +43,8 @@ def test_state_spec_identity_and_errors():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not NPZ.exists(), reason="needs CUDA + LAFAN1 npz")
-def test_world_model_overfits_replay_windows():
+@pytest.mark.parametrize("norm", ["fixed", "running"])
+def test_world_model_overfits_replay_windows(norm):
     """Collect a little data with a random policy, fit the WM for a few hundred steps: error must drop a lot."""
     from supermimic.data.motion_convert import load_g1_model
     from supermimic.envs import SuperMimicEnvCfgArgs, make_env
@@ -64,7 +65,7 @@ def test_world_model_overfits_replay_windows():
         robot = env.scene["robot"]
         fk = G1Kinematics(load_g1_model(), device=env.device)
         heads = AnalyticHeads(fk, TRACKED_BODIES, ANCHOR_BODY, ROOT_BODY, robot.data.soft_joint_pos_limits[0].clone(), robot.data.default_joint_pos[0].clone())
-        wm = WorldModel(WorldModelCfg(hidden=(512, 512, 512)), heads, env.device)
+        wm = WorldModel(WorldModelCfg(hidden=(512, 512, 512), normalization=norm, layer_norm=norm == "running"), heads, env.device)
         lib = env.command_manager.get_term("motion").library
         tr = WorldModelTrainer(wm, lib, WMTrainerCfg(batch_size=512, batches_per_update=1, lr=1e-3))
         e0 = tr.online_error(rec.buffer, n=1024, k=8)

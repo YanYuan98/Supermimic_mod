@@ -113,16 +113,16 @@ class ReplayBuffer:
 
     @torch.no_grad()
     def _sample_from_mask(self, mask: torch.Tensor, n: int) -> tuple[torch.Tensor, torch.Tensor]:
-        flat = mask.reshape(-1)
-        total = int(flat.sum().item())
-        if total == 0:
+        # A CPU-side guard instead of mask.sum().item(): no host sync per sample.
+        if self.total_rows == 0:
             raise RuntimeError("replay buffer has no sampleable rows yet")
-        idx = torch.multinomial(flat.float(), n, replacement=True)
+        idx = torch.multinomial(mask.reshape(-1).float(), n, replacement=True)
         return idx // self.T, idx % self.T
 
     @torch.no_grad()
-    def sample_windows(self, n: int, k: int) -> WindowBatch:
-        e, t = self._sample_from_mask(self.window_mask(k), n)
+    def sample_windows(self, n: int, k: int, mask: torch.Tensor | None = None) -> WindowBatch:
+        """``mask``: a precomputed ``window_mask(k)`` (reuse it across the batches of one update)."""
+        e, t = self._sample_from_mask(self.window_mask(k) if mask is None else mask, n)
         offs = torch.arange(k + 1, device=self.device)
         tt = (t[None, :] + offs[:, None]) % self.T  # (k+1, n)
         ee = e[None, :].expand(k + 1, n)
@@ -137,8 +137,11 @@ class ReplayBuffer:
         )
 
     @torch.no_grad()
-    def sample_starts(self, n: int, hist: int) -> StartBatch:
+    def sample_starts(self, n: int, hist: int, extra_mask: torch.Tensor | None = None) -> StartBatch:
+        """``extra_mask`` (E,T): additional admissible start rows (e.g. far enough from the clip end)."""
         mask = self.valid & ~self.terminal
+        if extra_mask is not None:
+            mask &= extra_mask
         t_idx = torch.arange(self.T, device=self.device)[None, :]
         dist_to_ptr = (self.ptr[:, None] - t_idx - 1) % self.T
         mask &= dist_to_ptr < self.T - hist - 1  # keep history rows from being overwritten underneath

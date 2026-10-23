@@ -20,6 +20,7 @@ import tyro
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 
+from supermimic.goal_spec import anchor_mode
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.envs.mdp.motion_library import discover_npz
 from supermimic.eval.benchmark import load_policy_from_checkpoint
@@ -60,7 +61,7 @@ def main(
         sampling_mode=sampling,
         record_transitions=False,
         seed=0,
-        anchor_obs=cfg["env"].get("anchor_obs", False),
+        anchor_obs=anchor_mode(cfg["env"].get("anchor_obs", False)), goal_features=cfg["env"].get("goal_features", "v1"), self_collision=cfg["env"].get("self_collision", True),
         debug_vis=ghost,
     )
     env = RslRlVecEnvWrapper(make_env(args, device=device))

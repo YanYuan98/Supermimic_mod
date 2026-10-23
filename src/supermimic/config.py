@@ -32,17 +32,28 @@ class EnvCfg:
     replay_capacity: int = 1000
     future_frames: int = 10
     compact_library: bool = False
-    anchor_obs: bool = False
+    # Reference-relative anchor pose in the goal (IMPROVEMENT_PLAN F2): "none" (pure reference goal),
+    # "ori" (reference anchor orientation in the robot anchor frame, 6-d, IMU-observable; default),
+    # "pos_ori" (+ anchor position, 9-d, needs state estimation).
+    anchor_obs: str = "ori"
+    # Per-frame goal features (F6): "v1" (68-d local reference quantities) or "traj" (77-d: + root
+    # displacement and rotation relative to the current target frame's heading frame).
+    goal_features: str = "traj"
+    # supermimic_vibed option: False drops robot self-collisions (feet / body vs ground only).
+    self_collision: bool = False
 
 
 @dataclass
 class ScheduleCfg:
-    total_iterations: int = 320_000  # env steps (plan D12 reading A)
+    # One iteration = one world-model update + one policy/critic update (Algorithm A.1: "Both omega and
+    # theta update every iteration"), preceded by 1/UTD vectorised env steps (fractional accumulator).
+    total_iterations: int = 320_000
     updates_per_env_step: float = 0.4  # UTD
     policy_updates_per_wm_update: int = 1
-    warmup_iterations: int = 40  # env steps before the first update (fills k-step windows)
+    warmup_env_steps: int = 40  # env steps collected before the first iteration (fills k-step windows)
+    wm_warmup_iterations: int = 500  # world-model-only iterations before the first policy update
     lr_final_ratio: float = 0.03
-    lr_decay_fraction: float = 250_000 / 320_000
+    lr_decay_iterations: int = 250_000
     log_interval: int = 50  # iterations
     checkpoint_interval: int = 4000  # iterations
     max_hours: float | None = None
@@ -63,3 +74,4 @@ class TrainConfig:
     policy_trainer: PolicyTrainerCfg = field(default_factory=PolicyTrainerCfg)
     schedule: ScheduleCfg = field(default_factory=ScheduleCfg)
     resume: Path | None = None
+    amp: str = "bf16"  # "bf16" (autocast for MLP matmuls; ~31% faster on RTX 5090) | "none" (TF32 matmuls, as in the paper)

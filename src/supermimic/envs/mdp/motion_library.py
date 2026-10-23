@@ -18,6 +18,8 @@ Goal features (per frame, 68-d, plan D5):
   [joint_pos - q0 (29), joint_vel (29), projected gravity of the ref root (3),
    ref root angular velocity in the root frame (3),
    ref root linear velocity in the ref heading frame (3), ref root height (1)]
+``traj`` mode (IMPROVEMENT_PLAN F6) appends, per frame, the ref root displacement (3) and rotation
+(6D, 6) relative to the heading frame of the window's first (current target) frame: 77-d.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from supermimic.kinematics.rotations import projected_gravity, quat_apply_inverse, yaw_quat
+from supermimic.kinematics.rotations import projected_gravity, quat_apply_inverse, quat_inv, quat_mul, rot6d_from_quat, yaw_quat
 
 GOAL_FEAT_DIM = 68
 REF_DIM = 71
@@ -223,15 +225,26 @@ class MotionLibrary:
     def last_frame_of(self, frame: torch.Tensor) -> torch.Tensor:
         return self.clip_last[self.frame_clip[frame]]
 
-    def goal_window(self, frame: torch.Tensor, k: int) -> torch.Tensor:
-        """(N, k*68) goal features of frames frame..frame+k-1, clamped at the clip end."""
+    def goal_window(self, frame: torch.Tensor, k: int, mode: str = "v1") -> torch.Tensor:
+        """(N, k*F) goal features of frames frame..frame+k-1, clamped at the clip end (F = GOAL_FEAT_DIMS[mode])."""
+        n = frame.shape[0]
         last = self.last_frame_of(frame)
         offs = torch.arange(k, device=self.device)
         idx = torch.minimum(frame[:, None] + offs[None, :], last[:, None])  # (N,k)
         if not self.compact:
-            return self.goal_feat[idx].reshape(frame.shape[0], k * GOAL_FEAT_DIM)
-        feat = goal_features(self.ref(idx.reshape(-1)), self.default_joint_pos)
-        return feat.reshape(frame.shape[0], k * GOAL_FEAT_DIM)
+            feat = self.goal_feat[idx]
+        else:
+            feat = goal_features(self.ref(idx.reshape(-1)), self.default_joint_pos).reshape(n, k, GOAL_FEAT_DIM)
+        if mode == "traj":
+            win = self._ref[idx].to(self.dtype)  # (N,k,71)
+            cur = self._ref[frame].to(self.dtype)  # (N,71)
+            h = yaw_quat(cur[:, 3:7])[:, None, :].expand(n, k, 4)
+            dp = quat_apply_inverse(h, win[..., 0:3] - cur[:, None, 0:3])
+            rot = rot6d_from_quat(quat_mul(quat_inv(h), win[..., 3:7]))
+            feat = torch.cat([feat, dp, rot], dim=-1)
+        elif mode != "v1":
+            raise ValueError(f"unknown goal feature mode {mode!r}")
+        return feat.reshape(n, -1)
 
     def ref_qpos_qvel(self, frame: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """MuJoCo-layout reference state: qpos (N,36) and qvel (N,35; root ang vel in body frame)."""

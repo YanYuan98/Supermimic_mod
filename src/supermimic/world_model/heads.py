@@ -13,9 +13,18 @@ from dataclasses import dataclass
 
 import torch
 
-from supermimic.envs.mdp.rewards import TrackingRewardCfg, tracking_reward_terms
+from supermimic.envs.mdp.rewards import TrackingRewardCfg, reanchor_reference, tracking_reward_terms
 from supermimic.kinematics.g1_fk import G1Kinematics
-from supermimic.kinematics.rotations import projected_gravity, quat_apply_inverse
+from supermimic.kinematics.rotations import (
+    heading_yaw,
+    matrix_from_quat,
+    projected_gravity,
+    quat_apply_inverse,
+    quat_inv,
+    quat_mul,
+    wrap_to_pi,
+    yaw_quat,
+)
 
 OBS_DIM = 93
 # Term layout of the ``policy`` observation group (order matters: term-major history).
@@ -39,19 +48,22 @@ def analytic_observation(
     return torch.cat([q + bias - default_joint_pos, qd, ang_b, projected_gravity(root_quat), prev_action], dim=-1)
 
 
-def anchor_relative_obs(robot_anchor_pos: torch.Tensor, robot_anchor_quat: torch.Tensor, ref_anchor_pos: torch.Tensor, ref_anchor_quat: torch.Tensor) -> torch.Tensor:
-    """Reference anchor pose expressed in the robot anchor frame: [pos (3), rot6d (6)] (= mjlab's
-    motion_anchor_pos_b / motion_anchor_ori_b, plan D5 alternative)."""
-    from supermimic.kinematics.rotations import matrix_from_quat, quat_inv, quat_mul
-
-    q10 = quat_inv(robot_anchor_quat)
-    pos = quat_apply_inverse(robot_anchor_quat, ref_anchor_pos - robot_anchor_pos)
-    q12 = quat_mul(q10, ref_anchor_quat)
-    mat = matrix_from_quat(q12)
-    return torch.cat([pos, mat[..., :2].reshape(*q12.shape[:-1], 6)], dim=-1)
-
-
 ANCHOR_OBS_DIM = 9
+
+
+def anchor_relative_obs(robot_anchor_pos: torch.Tensor, robot_anchor_quat: torch.Tensor, ref_anchor_pos: torch.Tensor, ref_anchor_quat: torch.Tensor, mode: str = "pos_ori") -> torch.Tensor:
+    """Reference anchor pose expressed in the robot anchor frame (= mjlab's motion_anchor_pos_b /
+    motion_anchor_ori_b): [pos (3), rot6d (6)] for ``pos_ori``, rot6d only for ``ori``."""
+    q12 = quat_mul(quat_inv(robot_anchor_quat), ref_anchor_quat)
+    rot6d = matrix_from_quat(q12)[..., :2].reshape(*q12.shape[:-1], 6)
+    if mode == "ori":
+        return rot6d
+    pos = quat_apply_inverse(robot_anchor_quat, ref_anchor_pos - robot_anchor_pos)
+    return torch.cat([pos, rot6d], dim=-1)
+
+
+# Critic-only privileged tracking errors (F5): root error 4 + anchor pose 9 + body positions 14*3 + joints 29.
+CRITIC_ERR_DIM = 4 + 9 + 14 * 3 + 29
 
 
 def flatten_history_term_major(hist: torch.Tensor) -> torch.Tensor:
@@ -75,6 +87,7 @@ class ReferenceFrame:
     body_ang_vel_w: torch.Tensor  # (N, B, 3)
     root_pos_w: torch.Tensor  # (N, 3)
     root_quat_w: torch.Tensor  # (N, 4)
+    joint_pos: torch.Tensor | None = None  # (N, 29) (critic error features only)
 
 
 class AnalyticHeads:
@@ -142,12 +155,27 @@ class AnalyticHeads:
         f = self.termination_features(s[..., 0:3], s[..., 3:7], ref)  # pelvis == free-joint root
         return (f[..., 0].abs() > height_thr) | (f[..., 1].abs() > tilt_thr)
 
+    def critic_error_features(self, s: torch.Tensor, ref: ReferenceFrame, bodies=None) -> torch.Tensor:
+        """Privileged tracking errors of state ``s`` w.r.t. reference ``ref`` for the critic (N, 84):
+        [root error (4), reference anchor pose in the robot anchor frame (9), re-anchored reference
+        body positions minus robot body positions in the robot anchor heading frame (42),
+        reference minus robot joint positions (29)]. Differentiable in ``s`` (through FK)."""
+        b = bodies if bodies is not None else self.robot_bodies(s)
+        ai = self.anchor_index
+        ra_pos, ra_quat = b["pos"][..., ai, :], b["quat"][..., ai, :]
+        ma_pos, ma_quat = ref.body_pos_w[..., ai, :], ref.body_quat_w[..., ai, :]
+        rel_pos, _ = reanchor_reference(ref.body_pos_w, ref.body_quat_w, ma_pos, ma_quat, ra_pos, ra_quat)
+        nb = rel_pos.shape[-2]
+        hq = yaw_quat(ra_quat)[..., None, :].expand(*ra_quat.shape[:-1], nb, 4)
+        e_body = quat_apply_inverse(hq, rel_pos - b["pos"]).reshape(*ra_pos.shape[:-1], nb * 3)
+        e_anchor = anchor_relative_obs(ra_pos, ra_quat, ma_pos, ma_quat, "pos_ori")
+        e_joint = ref.joint_pos - s[..., 7:36]
+        return torch.cat([self.root_error_features(s, ref), e_anchor, e_body, e_joint], dim=-1)
+
     @staticmethod
     def root_error_features(s: torch.Tensor, ref: ReferenceFrame) -> torch.Tensor:
         """Critic-only privileged drift features (plan D10): root position error in the reference
         heading frame (3) and yaw error (1). (N, 4)"""
-        from supermimic.kinematics.rotations import heading_yaw, quat_apply_inverse, wrap_to_pi, yaw_quat
-
         dp = quat_apply_inverse(yaw_quat(ref.root_quat_w), s[..., 0:3] - ref.root_pos_w)
         dyaw = wrap_to_pi(heading_yaw(s[..., 3:7]) - heading_yaw(ref.root_quat_w))
         return torch.cat([dp, dyaw[..., None]], dim=-1)

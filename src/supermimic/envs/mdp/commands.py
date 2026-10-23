@@ -95,7 +95,7 @@ class MultiClipMotionCommand(CommandTerm):
 
     @property
     def goal(self) -> torch.Tensor:
-        return self.library.goal_window(self.frame, self.cfg.future_frames)
+        return self.library.goal_window(self.frame, self.cfg.future_frames, self.cfg.goal_features)
 
     @property
     def joint_pos(self) -> torch.Tensor:
@@ -402,6 +402,7 @@ class MultiClipMotionCommandCfg(CommandTermCfg):
     body_names: tuple[str, ...]
     entity_name: str = "robot"
     future_frames: int = 10
+    goal_features: str = "v1"  # "v1" (68-d per frame) | "traj" (77-d per frame)
     bin_frames: int = 50
     pose_range: dict[str, tuple[float, float]] = field(default_factory=dict)
     velocity_range: dict[str, tuple[float, float]] = field(default_factory=dict)

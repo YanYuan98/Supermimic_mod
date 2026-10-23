@@ -9,12 +9,12 @@ import torch
 import tyro
 
 
-def main(batch: int = 2048, horizon: int = 32, modes: tuple[str, ...] = ("eager", "default"), reps: int = 3, clips: int = 1) -> None:
+def main(batch: int = 2048, horizon: int = 32, modes: tuple[str, ...] = ("eager", "default"), reps: int = 3, clips: int = 1, amp: str = "none") -> None:
     from supermimic.data.motion_convert import load_g1_model
     from supermimic.data.replay_buffer import StartBatch
     from supermimic.envs.mdp.motion_library import MotionLibrary, discover_npz
     from supermimic.envs.tracking_env_cfg import ANCHOR_BODY, ROOT_BODY, TRACKED_BODIES
-    from supermimic.imagination.compiled import ImagStep
+    from supermimic.imagination.compiled import ImagHeads, ImagStep
     from supermimic.imagination.objective import policy_objective
     from supermimic.imagination.rollout import imagine
     from supermimic.kinematics.g1_fk import G1Kinematics
@@ -22,6 +22,9 @@ def main(batch: int = 2048, horizon: int = 32, modes: tuple[str, ...] = ("eager"
     from supermimic.world_model.heads import AnalyticHeads
     from supermimic.world_model.world_model import WorldModel, WorldModelCfg
 
+    from supermimic.world_model import dynamics
+
+    dynamics.AMP_DTYPE = {"none": None, "bf16": torch.bfloat16}[amp]
     torch.backends.cuda.matmul.allow_tf32 = True
     dev = "cuda:0"
     model = load_g1_model()
@@ -47,13 +50,15 @@ def main(batch: int = 2048, horizon: int = 32, modes: tuple[str, ...] = ("eager"
         hist_actions=torch.zeros(10, batch, 29, device=dev),
     )
     for mode in modes:
-        step_fn = ImagStep(wm, q0, compile_mode=None if mode == "eager" else mode)
+        cm = None if mode == "eager" else mode
+        step_fn = ImagStep(wm, policy, q0, anchor_obs="none", compile_mode=cm)
+        heads_fn = ImagHeads(wm, critic_features=True, compile_mode=cm)
         wm.requires_grad_(False)
         times = []
         for i in range(reps + 1):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            ro = imagine(wm, policy, lib, start, horizon, step_fn=step_fn)
+            ro = imagine(lib, start, horizon, step_fn, heads_fn)
             J = policy_objective(ro, None, 0.99)
             (-J).backward()
             policy.zero_grad(set_to_none=True)

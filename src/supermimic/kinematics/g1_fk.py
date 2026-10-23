@@ -165,3 +165,25 @@ class G1Kinematics:
         return out
 
     __call__ = forward
+
+    def chain_pose(self, qpos: torch.Tensor, body: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """World pose (pos (..., 3), quat (..., 4)) of one body, computing only its kinematic chain
+        from the root (e.g. pelvis -> 3 waist joints -> torso_link). Matches ``forward`` exactly."""
+        chain = []
+        i = body
+        while i > 0:
+            chain.append(i)
+            i = self.links[i].parent_index
+        batch = qpos.shape[:-1]
+        b_pos = qpos[..., 0:3]
+        b_quat = quat_normalize(qpos[..., 3:7])
+        for i in reversed(chain):
+            l = self.links[i]
+            b_pos = b_pos + quat_apply(b_quat, self.body_pos[i].expand(*batch, 3))
+            b_quat = quat_mul(b_quat, self.body_quat[i].expand(*batch, 4))
+            if l.joint_type == mujoco.mjtJoint.mjJNT_HINGE:
+                anchor = b_pos + quat_apply(b_quat, self.jnt_pos[i].expand(*batch, 3))
+                q_loc = quat_from_angle_axis(qpos[..., l.qpos_adr] - self.qpos0[i], self.jnt_axis[i].expand(*batch, 3))
+                b_quat = quat_mul(b_quat, q_loc)
+                b_pos = anchor - quat_apply(b_quat, self.jnt_pos[i].expand(*batch, 3))
+        return b_pos, b_quat

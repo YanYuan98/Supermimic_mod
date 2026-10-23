@@ -33,18 +33,27 @@ class PolicyTrainerCfg:
     critic_minibatches: int = 4
     use_critic: bool = True
     obs_noise: bool = True
-    compile: str | None = "default"
-    anchor_obs: bool = False  # None | "default" | "reduce-overhead" | "max-autotune-no-cudagraphs"
+    compile: str | None = "default"  # None | "default" | "reduce-overhead" | "max-autotune-no-cudagraphs"
+    anchor_obs: str = "ori"  # set from EnvCfg by the trainer
+    goal_features: str = "v1"  # set from EnvCfg by the trainer
+    # "sum": loss = -J (Eq. 2, batch mean) so Table A.5's clipping acts on the paper's objective;
+    # "per_step": loss = -J / H (the v1 behaviour).
+    objective_scale: str = "sum"
+    # supermimic_vibed option: only start imagined rollouts at states whose target frame is at least
+    # ``start_margin`` frames before the clip end (0 = any state; past the end the last frame is held).
+    start_margin: int = 32
 
 
 class PolicyTrainer:
     def __init__(self, wm: WorldModel, policy: Policy, critic: Critic, lib: MotionLibrary, cfg: PolicyTrainerCfg):
         self.wm, self.policy, self.critic, self.lib, self.cfg = wm, policy, critic, lib, cfg
-        self.opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr, betas=cfg.betas)
-        self.critic_opt = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr)
-        from supermimic.imagination.compiled import ImagStep
+        fused = torch.cuda.is_available()
+        self.opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr, betas=cfg.betas, fused=fused)
+        self.critic_opt = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr, fused=fused)
+        from supermimic.imagination.compiled import ImagHeads, ImagStep
 
-        self.step_fn = ImagStep(wm, lib.default_joint_pos, compile_mode=cfg.compile)
+        self.step_fn = ImagStep(wm, policy, lib.default_joint_pos, anchor_obs=cfg.anchor_obs, obs_noise=cfg.obs_noise, compile_mode=cfg.compile)
+        self.heads_fn = ImagHeads(wm, critic_features=critic.err_dim > 4, compile_mode=cfg.compile)
 
     def set_lr(self, lr: float) -> None:
         for g in self.opt.param_groups:
@@ -55,24 +64,27 @@ class PolicyTrainer:
     def _critic_inputs(self, ro: ImagRollout):
         H1, n, _ = ro.states.shape
         feat = self.wm.spec.canonical(ro.states.reshape(H1 * n, -1)).reshape(H1, n, -1)
-        return feat, ro.goals, ro.e_root
+        return feat, ro.goals, ro.crit_feat
 
     def update(self, buffer: ReplayBuffer, xi_norm_fn=None) -> dict[str, float]:
         cfg = self.cfg
-        start = buffer.sample_starts(cfg.batch_size, cfg.history)
+        extra = None
+        if cfg.start_margin > 0:
+            extra = buffer.frame + cfg.start_margin <= self.lib.last_frame_of(buffer.frame)
+        start = buffer.sample_starts(cfg.batch_size, cfg.history, extra_mask=extra)
         xi_norm = self.wm.spec.normalize_xi(start.xi)
 
         # ---- actor: BPTT through the frozen world model ------------------------------------
         self.wm.requires_grad_(False)
         self.critic.requires_grad_(False)
-        ro = imagine(self.wm, self.policy, self.lib, start, cfg.horizon, cfg.future_frames, obs_noise=cfg.obs_noise, step_fn=self.step_fn, anchor_obs=cfg.anchor_obs)
-        feat, goals, e_root = self._critic_inputs(ro)
+        ro = imagine(self.lib, start, cfg.horizon, self.step_fn, self.heads_fn, cfg.future_frames, cfg.goal_features)
+        feat, goals, err = self._critic_inputs(ro)
         if cfg.use_critic:
-            v_H = self.critic(feat[-1], goals[-1], xi_norm, e_root[-1])
+            v_H = self.critic(feat[-1], goals[-1], xi_norm, err[-1])
         else:
             v_H = None
         J = policy_objective(ro, v_H, cfg.gamma)
-        loss = -J / cfg.horizon
+        loss = -J if cfg.objective_scale == "sum" else -J / cfg.horizon
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         allreduce_grads(self.policy)
@@ -82,14 +94,15 @@ class PolicyTrainer:
         self.wm.requires_grad_(True)
         self.critic.requires_grad_(True)
 
+        # Metrics stay on-device until one host sync at the end of the update.
         metrics = {
-            "imag_objective": float(J.detach()),
-            "imag_return_undisc": float((ro.survival[:-1] * ro.rewards).sum(0).mean().detach()),
-            "imag_reward_mean": float(ro.rewards.mean().detach()),
-            "imag_survival_H": float(ro.survival[-1].mean().detach()),
-            "imag_dhat_mean": float(ro.dhat[1:].mean().detach()),
-            "policy_grad_norm": float(gn),
-            "action_abs_mean": float(ro.actions.abs().mean().detach()),
+            "imag_objective": J.detach(),
+            "imag_return_undisc": (ro.survival[:-1] * ro.rewards).sum(0).mean().detach(),
+            "imag_reward_mean": ro.rewards.mean().detach(),
+            "imag_survival_H": ro.survival[-1].mean().detach(),
+            "imag_dhat_mean": ro.dhat[1:].mean().detach(),
+            "policy_grad_norm": gn.detach(),
+            "action_abs_mean": ro.actions.abs().mean().detach(),
         }
         for k, v in ro.reward_terms.items():
             metrics[f"imag_r/{k}"] = v
@@ -97,15 +110,15 @@ class PolicyTrainer:
         # ---- critic: fit to GAE targets of this rollout (targets fixed) ---------------------
         if cfg.use_critic:
             with torch.no_grad():
-                feat_d, goals_d, e_root_d = feat.detach(), goals.detach(), e_root.detach()
+                feat_d, goals_d, err_d = feat.detach(), goals.detach(), err.detach()
                 H1, n, _ = feat_d.shape
                 xi_rep = xi_norm[None].expand(H1, n, -1)
-                values = self.critic(feat_d.reshape(H1 * n, -1), goals_d.reshape(H1 * n, -1), xi_rep.reshape(H1 * n, -1), e_root_d.reshape(H1 * n, -1)).reshape(H1, n)
+                values = self.critic(feat_d.reshape(H1 * n, -1), goals_d.reshape(H1 * n, -1), xi_rep.reshape(H1 * n, -1), err_d.reshape(H1 * n, -1)).reshape(H1, n)
                 targets = gae_targets(ro.rewards.detach(), ro.dhat[1:].detach(), values, cfg.gamma, cfg.gae_lambda)  # (H, n)
                 X_feat = feat_d[:-1].reshape(-1, feat_d.shape[-1])
                 X_goal = goals_d[:-1].reshape(-1, goals_d.shape[-1])
                 X_xi = xi_rep[:-1].reshape(-1, xi_rep.shape[-1])
-                X_er = e_root_d[:-1].reshape(-1, 4)
+                X_err = err_d[:-1].reshape(-1, err_d.shape[-1])
                 Y = targets.reshape(-1)
             N = Y.shape[0]
             mb = N // cfg.critic_minibatches
@@ -114,7 +127,7 @@ class PolicyTrainer:
                 perm = torch.randperm(N, device=Y.device)
                 for i in range(cfg.critic_minibatches):
                     idx = perm[i * mb : (i + 1) * mb]
-                    pred = self.critic(X_feat[idx], X_goal[idx], X_xi[idx], X_er[idx])
+                    pred = self.critic(X_feat[idx], X_goal[idx], X_xi[idx], X_err[idx])
                     closs = torch.nn.functional.mse_loss(pred, Y[idx])
                     self.critic_opt.zero_grad(set_to_none=True)
                     closs.backward()
@@ -122,7 +135,9 @@ class PolicyTrainer:
                     torch.nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.critic_grad_clip)
                     self.critic_opt.step()
                     last = closs.detach()
-            metrics["critic_loss"] = float(last)
-            metrics["critic_value_mean"] = float(values.mean())
-            metrics["critic_target_mean"] = float(targets.mean())
-        return metrics
+            metrics["critic_loss"] = last
+            metrics["critic_value_mean"] = values.mean()
+            metrics["critic_target_mean"] = targets.mean()
+        keys = list(metrics)
+        vals = torch.stack([metrics[k].float().reshape(()) for k in keys]).tolist()
+        return dict(zip(keys, vals))

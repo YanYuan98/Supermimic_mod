@@ -92,7 +92,10 @@ class StateSpec:
 
     def integrate(self, s: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
         """Apply the (unscaled) network output ``delta`` (…, 70) to state ``s`` (…, 71)."""
-        d = delta * self.out_scale
+        return self.integrate_physical(s, delta * self.out_scale)
+
+    def integrate_physical(self, s: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
+        """Apply increments ``d`` (…, 70) in physical units [dv_h, dw_b, dqd, dp_h, dth_b, dq] to ``s``."""
         dv_h, dw_b, dqd, dp_h, dth_b, dq = d[..., 0:3], d[..., 3:6], d[..., 6:35], d[..., 35:38], d[..., 38:41], d[..., 41:70]
         p, q, qj, v, w, qd = self.split(s)
         q = quat_normalize(q)
@@ -105,6 +108,18 @@ class StateSpec:
         q_new = quat_normalize(quat_mul(q, quat_from_rotvec(dt * w_new + dth_b)))
         qj_new = qj + dt * qd_new + dq
         return torch.cat([p_new, q_new, qj_new, v_new, w_new, qd_new], dim=-1)
+
+    def target_delta(self, s: torch.Tensor, s_next: torch.Tensor) -> torch.Tensor:
+        """Inverse of ``integrate_physical``: the increments (…, 70) that map ``s`` exactly to ``s_next``."""
+        p, q, qj, v, w, qd = self.split(s)
+        p1, q1, qj1, v1, w1, qd1 = self.split(s_next)
+        q, q1 = quat_normalize(q), quat_normalize(q1)
+        hq = heading_quat(q)
+        dt = self.dt if self.cfg.explicit_integration else 0.0
+        dv_h = quat_apply_inverse(hq, v1 - v)
+        dp_h = quat_apply_inverse(hq, p1 - p - dt * v1)
+        dth_b = rotvec_from_quat(quat_mul(quat_apply_inverse_quat(q), q1)) - dt * w1
+        return torch.cat([dv_h, w1 - w, qd1 - qd, dp_h, dth_b, qj1 - qj - dt * qd1], dim=-1)
 
     # ------------------------------------------------------------------ errors
 

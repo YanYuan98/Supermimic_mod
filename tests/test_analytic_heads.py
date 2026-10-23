@@ -139,8 +139,10 @@ def test_termination_matches_env(setup):
         assert torch.equal((f[:, 1].abs() > 0.8), theirs_t) or (f[:, 1].abs() - 0.8).abs().min() < 1e-4
 
 
-def test_anchor_relative_obs_matches_env():
-    """The analytic anchor-relative term (from state via FK) equals mjlab's observation terms."""
+@pytest.mark.parametrize("mode,goal_features", [("pos_ori", "v1"), ("ori", "v1"), ("ori", "traj")])
+def test_anchor_relative_obs_matches_env(mode, goal_features):
+    """The analytic anchor-relative term (from state via FK) equals mjlab's observation terms, and the
+    environment's goal equals the library's goal window (the imagination's goal) for every layout."""
     from supermimic.data.motion_convert import load_g1_model
     from supermimic.envs import SuperMimicEnvCfgArgs, make_env
     from supermimic.envs.mdp.motion_library import discover_npz
@@ -150,14 +152,18 @@ def test_anchor_relative_obs_matches_env():
     from supermimic.world_model.heads import AnalyticHeads, anchor_relative_obs
 
     files = discover_npz(NPZ, names=["walk1_subject1"])
-    env = make_env(SuperMimicEnvCfgArgs(npz_files=[str(f) for f in files], num_envs=8, obs_noise=False, anchor_obs=True, record_transitions=False, seed=4), "cuda:0")
+    from supermimic.goal_spec import goal_dim
+
+    env = make_env(SuperMimicEnvCfgArgs(npz_files=[str(f) for f in files], num_envs=8, obs_noise=False, anchor_obs=mode, goal_features=goal_features, record_transitions=False, seed=4), "cuda:0")
     torch.backends.cuda.matmul.allow_tf32 = False
     try:
         robot = env.scene["robot"]
         heads = AnalyticHeads(G1Kinematics(load_g1_model(), device=env.device), TRACKED_BODIES, ANCHOR_BODY, ROOT_BODY, robot.data.soft_joint_pos_limits[0].clone(), robot.data.default_joint_pos[0].clone())
         io = StateIO(env)
         obs, _ = env.reset()
-        assert obs["goal"].shape == (8, 689)
+        gd = goal_dim(10, goal_features, mode)
+        nf = goal_dim(10, goal_features, "none")
+        assert obs["goal"].shape == (8, gd)
         cmd = env.command_manager.get_term("motion")
         for _ in range(5):
             obs, *_ = env.step(0.3 * torch.randn(8, 29, device=env.device))
@@ -165,7 +171,9 @@ def test_anchor_relative_obs_matches_env():
             b = heads.robot_bodies(s)
             ai = heads.anchor_index
             ref = _ref_from_command(cmd)
-            ours = anchor_relative_obs(b["pos"][:, ai], b["quat"][:, ai], ref.body_pos_w[:, ai], ref.body_quat_w[:, ai])
-            np.testing.assert_allclose(ours.cpu().numpy(), obs["goal"][:, 680:].cpu().numpy(), atol=3e-5)
+            ours = anchor_relative_obs(b["pos"][:, ai], b["quat"][:, ai], ref.body_pos_w[:, ai], ref.body_quat_w[:, ai], mode)
+            np.testing.assert_allclose(ours.cpu().numpy(), obs["goal"][:, nf:].cpu().numpy(), atol=3e-5)
+            lib_goal = cmd.library.goal_window(cmd.frame, 10, goal_features)
+            np.testing.assert_allclose(lib_goal.cpu().numpy(), obs["goal"][:, :nf].cpu().numpy(), atol=1e-6)
     finally:
         env.close()

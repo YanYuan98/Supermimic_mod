@@ -36,6 +36,7 @@ from supermimic.envs.actions import NoisyJointPositionActionCfg
 from supermimic.envs.mdp import observations as sm_obs
 from supermimic.envs.mdp import terminations as sm_term
 from supermimic.envs.mdp.commands import MultiClipMotionCommandCfg
+from supermimic.goal_spec import anchor_mode
 
 class QuietSimulationCfg(SimulationCfg):
     """SimulationCfg that disables MuJoCo Warp's per-step overflow printf (a kernel build-time constant,
@@ -87,7 +88,9 @@ class SuperMimicEnvCfgArgs:
     joint_limit_weight: float = -2.0
     bin_frames: int = 50
     compact_library: bool = False
-    anchor_obs: bool = False  # add BeyondMimic anchor-relative pose (9) to the goal group (plan D5 alt.)
+    anchor_obs: str = "ori"  # "none" | "ori" (6, IMU-observable) | "pos_ori" (9, needs state estimation)
+    goal_features: str = "v1"  # per-frame goal features: "v1" (68) | "traj" (77)
+    self_collision: bool = True  # False: mjlab's FULL_COLLISION_WITHOUT_SELF (as supermimic_vibed)
     debug_vis: bool = False  # draw the reference ghost in the viewer (scripts/play.py)
     extra_command_kwargs: dict = field(default_factory=dict)
 
@@ -102,6 +105,13 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         "projected_gravity": ObservationTermCfg(func=base_mdp.projected_gravity, noise=noise(-0.05, 0.05)),
         "actions": ObservationTermCfg(func=base_mdp.last_action),
     }
+    # Reference anchor pose relative to the robot anchor, appended to the goal (IMPROVEMENT_PLAN F2).
+    mode = anchor_mode(a.anchor_obs)
+    anchor_terms = {}
+    if mode == "pos_ori":
+        anchor_terms["anchor_pos"] = ObservationTermCfg(func=track_mdp.motion_anchor_pos_b, params={"command_name": "motion"}, noise=noise(-0.25, 0.25))
+    if mode in ("ori", "pos_ori"):
+        anchor_terms["anchor_ori"] = ObservationTermCfg(func=track_mdp.motion_anchor_ori_b, params={"command_name": "motion"}, noise=noise(-0.05, 0.05))
     observations = {
         "policy": ObservationGroupCfg(
             terms=policy_terms,
@@ -113,14 +123,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         "goal": ObservationGroupCfg(
             terms={
                 "future_frames": ObservationTermCfg(func=sm_obs.goal_future_frames, params={"command_name": "motion"}),
-                **(
-                    {
-                        "anchor_pos": ObservationTermCfg(func=track_mdp.motion_anchor_pos_b, params={"command_name": "motion"}, noise=noise(-0.25, 0.25)),
-                        "anchor_ori": ObservationTermCfg(func=track_mdp.motion_anchor_ori_b, params={"command_name": "motion"}, noise=noise(-0.05, 0.05)),
-                    }
-                    if a.anchor_obs
-                    else {}
-                ),
+                **anchor_terms,
             },
             concatenate_terms=True,
             enable_corruption=a.obs_noise,
@@ -149,6 +152,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             body_names=TRACKED_BODIES,
             entity_name="robot",
             future_frames=a.future_frames,
+            goal_features=a.goal_features,
             bin_frames=a.bin_frames,
             pose_range=pose_range if a.reset_noise else {},
             velocity_range=vel_range if a.reset_noise else {},
@@ -224,8 +228,13 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
     if a.record_transitions:
         recorders["replay"] = ReplayRecorderCfg(params={"capacity": a.replay_capacity, "foot_geom_regex": FOOT_GEOM_REGEX, "com_body_name": "torso_link"})
 
+    robot_cfg = get_g1_robot_cfg()
+    if not a.self_collision:
+        from mjlab.asset_zoo.robots.unitree_g1.g1_constants import FULL_COLLISION_WITHOUT_SELF
+
+        robot_cfg.collisions = (FULL_COLLISION_WITHOUT_SELF,)
     cfg = ManagerBasedRlEnvCfg(
-        scene=SceneCfg(terrain=TerrainEntityCfg(terrain_type="plane"), num_envs=a.num_envs, entities={"robot": get_g1_robot_cfg()}),
+        scene=SceneCfg(terrain=TerrainEntityCfg(terrain_type="plane"), num_envs=a.num_envs, entities={"robot": robot_cfg}),
         observations=observations,
         actions=actions,
         commands=commands,
