@@ -2,9 +2,9 @@
 
 从零复现 SuperMimic：用一个学习得到的可微世界模型，通过短视野 BPTT 训练 Unitree G1（29 自由度）的全身动作跟踪策略。仿真底座为 mjlab（MuJoCo Warp），世界模型、想象训练器、多 clip 动作库、基于回报的重置采样、评测全部自行实现，不依赖 rsl_rl。
 
-[![SuperMimic 与 RGMT 对比视频](docs/media/supermimic_vs_rgmt_g1_thumb.jpg)](https://www.bilibili.com/video/BV1ZGnt68EEZ/?spm_id_from=333.1365.top_right_bar_window_history.content.click&vd_source=0cf6dfba952d78da546c124a068c21e0)
+[![SuperMimic 与 RGMT 对比视频](docs/media/supermimic_vs_rgmt_g1_thumb.jpg)](https://www.bilibili.com/video/BV1ZGnt68EEZ/)
 
-*点击图片观看 SuperMimic 与 RGMT 的对比视频（2:24，详见[第 7 节](#7-与-rgmt-的对比视频)）。*
+*点击图片在 B 站观看 SuperMimic 与 RGMT 的对比视频（2:24，详见[第 7 节](#7-与-rgmt-的对比视频)）。*
 
 ## 1. 复现的论文
 
@@ -111,13 +111,10 @@ BONES-SEED 的转换、过滤、打包见 `scripts/data/filter_bones_seed.py`、
 - **双卡设置**：每张卡各自 4096 个环境和回放缓冲，梯度和归一化统计量做 all-reduce，学习率 ×√2（论文的双卡设置）。按墙钟时间更早达到 0.82，3 h 终点与单卡相当。
 - **单个检查点的评测分数波动较大**：例如一个种子在第 16000 次迭代掉到 0.721、9/40 失败，前后检查点都在 0.82 以上。原因是整条 clip（平均约 220 s）的确定性评测对一次摔倒非常敏感，建议评测多个检查点再挑选。
 - **纯参考目标的对照**：不含相对朝向（`--env.anchor-obs none`），同样训练 3 h 只有 0.564、5/40 失败。
-- 完整的实验记录、消融与历史结果见 [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md)；其中 v1 的 e2–e8 使用旧评测口径，数字偏高。
 
 ## 7. 与 RGMT 的对比视频
 
-[![SuperMimic 与 RGMT 对比视频](docs/media/supermimic_vs_rgmt_g1_thumb.jpg)](docs/media/supermimic_vs_rgmt_g1.mp4)
-
-[`docs/media/supermimic_vs_rgmt_g1.mp4`](docs/media/supermimic_vs_rgmt_g1.mp4)（2:24，720p；1080p 原版由 `scripts/render_compare.py` 生成）。
+[![SuperMimic 与 RGMT 对比视频](docs/media/supermimic_vs_rgmt_g1_thumb.jpg)](https://www.bilibili.com/video/BV1ZGnt68EEZ/)
 
 - 左：SuperMimic，第 6 节的双卡模型（3 h 终点）；右：RGMT，rgmt_mjlab 的最新模型 `stage1_v4_smooth / model_39999`。
 - 两侧使用同一个 G1 模型、同样的相机和叠加样式。半透明蓝色为参考动作，已对齐到机器人的水平位置与朝向。
