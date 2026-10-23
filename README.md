@@ -1,6 +1,6 @@
-# SuperMimic-Reproduced
+# SuperMimic
 
-从零复现 SuperMimic：用一个学习得到的可微世界模型，通过短视野 BPTT 训练 Unitree G1（29 自由度）的全身动作跟踪策略。仿真底座为 mjlab（MuJoCo Warp），世界模型、想象训练器、多 clip 动作库、基于回报的重置采样、评测全部自行实现，不依赖 rsl_rl。
+从零复现 SuperMimic：用一个学习得到的可微世界模型，通过短视野 BPTT 训练 Unitree G1（29 自由度）的全身动作跟踪策略，仿真器为 mjlab（MuJoCo Warp）。
 
 [![SuperMimic 与 RGMT 对比视频](docs/media/supermimic_vs_rgmt_g1_thumb.jpg)](https://www.bilibili.com/video/BV1ZGnt68EEZ/)
 
@@ -15,8 +15,8 @@ Q. Liao, Y. Shao, J. Long, K. Zakka, R. Horowitz, P. Abbeel, K. Sreenath（UC Be
 
 | 名称 | 用途 |
 |---|---|
-| supermimic_vibed（Chong Zhang，ETH Zurich，MIT 许可） | 另一份基于 Isaac Lab 3 的 SuperMimic 复现 |
-| SuperMimic-Reproduced | 该项目的baseline |
+| supermimic_vibed（Chong Zhang） | 基于 Isaac Lab 3 的 SuperMimic 复现，驱动要求 580 (老顽固570放弃) |
+| SuperMimic-Reproduced (CuboiLeo)| 该项目的baseline |
 
 
 ## 3. 环境安装
