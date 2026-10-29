@@ -95,6 +95,10 @@ class G1Kinematics:
         self.hinge_body_idx = [i for i, l in enumerate(links) if l.joint_type == mujoco.mjtJoint.mjJNT_HINGE]
         self.hinge_qpos_adr = torch.tensor([links[i].qpos_adr for i in self.hinge_body_idx], device=self.device)
         self.hinge_dof_adr = torch.tensor([links[i].dof_adr for i in self.hinge_body_idx], device=self.device)
+        self._stacked_chains: dict[tuple[int, ...], list | None] = {}
+        feet = ("left_ankle_roll_link", "right_ankle_roll_link")  # terrain foot features (TerrainMap.foot_points)
+        if all(f in self.body_names for f in feet):
+            self._stacked_chain(tuple(self.body_index(f) for f in feet))
 
     def body_index(self, name: str) -> int:
         return self.body_names.index(name)
@@ -166,18 +170,67 @@ class G1Kinematics:
 
     __call__ = forward
 
-    def chain_pose(self, qpos: torch.Tensor, body: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """World pose (pos (..., 3), quat (..., 4)) of one body, computing only its kinematic chain
-        from the root (e.g. pelvis -> 3 waist joints -> torso_link). Matches ``forward`` exactly."""
+    def _chain(self, body: int) -> list[int]:
+        """Body indices from the root's first child down to ``body`` (the root itself excluded)."""
         chain = []
         i = body
         while i > 0:
             chain.append(i)
             i = self.links[i].parent_index
+        return chain[::-1]
+
+    def _stacked_chain(self, bodies: tuple[int, ...]):
+        """Per-level constants of equal-length, equal-joint-type chains stacked over ``bodies`` (cached), or None.
+        The two feet are prepared in ``__init__`` so compiled callers never build the cache while tracing."""
+        cache = self._stacked_chains
+        if bodies not in cache:
+            chains = [self._chain(b) for b in bodies]
+            types = [tuple(self.links[i].joint_type for i in c) for c in chains]
+            if len(set(types)) != 1:
+                cache[bodies] = None
+            else:
+                levels = []
+                for level, jt in enumerate(types[0]):
+                    idx = torch.tensor([c[level] for c in chains], device=self.device)
+                    adr = torch.tensor([self.links[c[level]].qpos_adr for c in chains], device=self.device)
+                    axis = self.jnt_axis[idx]
+                    axis = axis / axis.norm(dim=-1, keepdim=True).clamp_min(1e-12)  # unit (MuJoCo already normalises)
+                    levels.append((jt == mujoco.mjtJoint.mjJNT_HINGE, self.body_pos[idx], self.body_quat[idx], self.jnt_pos[idx], axis, self.qpos0[idx], adr))
+                cache[bodies] = levels
+        return cache[bodies]
+
+    def chain_poses(self, qpos: torch.Tensor, bodies: tuple[int, ...]) -> tuple[torch.Tensor, torch.Tensor]:
+        """World poses (pos (..., B, 3), quat (..., B, 4)) of several bodies, e.g. both ``*_ankle_roll_link``.
+        Chains with the same joint-type sequence (the two legs) run as one stacked chain: one set of kernels for
+        all B bodies instead of B, and the hinge rotations use the precomputed unit axes (no per-call axis /
+        quaternion normalisation: fewer reductions, i.e. fewer compiled kernels). Matches ``chain_pose`` to
+        rounding (1e-6 in fp32)."""
+        levels = self._stacked_chain(tuple(int(b) for b in bodies))
+        if levels is None:
+            out = [self.chain_pose(qpos, b) for b in bodies]
+            return torch.stack([p for p, _ in out], -2), torch.stack([q for _, q in out], -2)
+        nb = len(bodies)
+        batch = qpos.shape[:-1]
+        b_pos = qpos[..., None, 0:3].expand(*batch, nb, 3)
+        b_quat = quat_normalize(qpos[..., 3:7])[..., None, :].expand(*batch, nb, 4)
+        for hinge, body_pos, body_quat, jnt_pos, jnt_axis, qpos0, adr in levels:
+            b_pos = b_pos + quat_apply(b_quat, body_pos.expand(*batch, nb, 3))
+            b_quat = quat_mul(b_quat, body_quat.expand(*batch, nb, 4))
+            if hinge:
+                anchor = b_pos + quat_apply(b_quat, jnt_pos.expand(*batch, nb, 3))
+                half = 0.5 * (qpos.index_select(-1, adr) - qpos0)[..., None]
+                q_loc = torch.cat([torch.cos(half), jnt_axis * torch.sin(half)], dim=-1)
+                b_quat = quat_mul(b_quat, q_loc)
+                b_pos = anchor - quat_apply(b_quat, jnt_pos.expand(*batch, nb, 3))
+        return b_pos, b_quat
+
+    def chain_pose(self, qpos: torch.Tensor, body: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """World pose (pos (..., 3), quat (..., 4)) of one body, computing only its kinematic chain
+        from the root (e.g. pelvis -> 3 waist joints -> torso_link). Matches ``forward`` exactly."""
         batch = qpos.shape[:-1]
         b_pos = qpos[..., 0:3]
         b_quat = quat_normalize(qpos[..., 3:7])
-        for i in reversed(chain):
+        for i in self._chain(body):
             l = self.links[i]
             b_pos = b_pos + quat_apply(b_quat, self.body_pos[i].expand(*batch, 3))
             b_quat = quat_mul(b_quat, self.body_quat[i].expand(*batch, 4))

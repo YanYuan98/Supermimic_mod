@@ -9,12 +9,19 @@ Differences from mjlab's BeyondMimic re-implementation (``mjlab.tasks.tracking``
   * terminations: pelvis height / tilt vs reference, no end-effector term, clip-end time-out;
   * events: no push; friction and encoder bias re-sampled per episode; COM at startup;
   * a ``ReplayRecorder`` streams transitions into a GPU replay buffer.
+
+Terrain (``terrain`` = plane | mixed, docs/VISION_TERRAIN_PLAN.md §2.3, §2.7): an extra ``terrain``
+observation group (the noisy 17x11 policy height scan); ``mixed`` replaces the ground plane by the
+curriculum terrain grid (+ flat outer border), raises the MuJoCo Warp capacities and installs the height-field
+contact-normal fix (``terrain.mjwarp_patch``). ``none`` (default) builds exactly the flat environment.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
+import mujoco
 from mjlab.asset_zoo.robots import G1_ACTION_SCALE, get_g1_robot_cfg
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as base_mdp
@@ -37,6 +44,7 @@ from supermimic.envs.mdp import observations as sm_obs
 from supermimic.envs.mdp import terminations as sm_term
 from supermimic.envs.mdp.commands import MultiClipMotionCommandCfg
 from supermimic.goal_spec import anchor_mode
+from supermimic.terrain.heightmap import ScanNoiseCfg, TerrainMapCfg
 
 class QuietSimulationCfg(SimulationCfg):
     """SimulationCfg that disables MuJoCo Warp's per-step overflow printf (a kernel build-time constant,
@@ -93,6 +101,22 @@ class SuperMimicEnvCfgArgs:
     self_collision: bool = True  # False: mjlab's FULL_COLLISION_WITHOUT_SELF (as supermimic_vibed)
     debug_vis: bool = False  # draw the reference ghost in the viewer (scripts/play.py)
     extra_command_kwargs: dict = field(default_factory=dict)
+    # Terrain (VISION_TERRAIN_PLAN): "none" (main's flat env) | "plane" | "mixed".
+    terrain: str = "none"
+    terrain_seed: int = 0
+    terrain_size: float = 12.0
+    terrain_rows: int = 10
+    terrain_border: float = 4.0
+    terrain_res: float = 0.025
+    terrain_level: int = 2  # initial curriculum level (max spawn row)
+    terrain_cache_dir: str | None = "logs/terrain_cache"
+    spawn_margin: float = 0.5
+    scan_noise: ScanNoiseCfg = field(default_factory=ScanNoiseCfg)  # applied only with obs_noise (or scan_noise_always)
+    scan_noise_always: bool = False  # apply scan_noise even with obs_noise off (benchmark robustness, plan M5-A)
+    # MuJoCo Warp capacity overrides (None = main's njmax 250 / nconmax 35 / ccd_iterations 50).
+    njmax: int | None = None
+    nconmax: int | None = None
+    ccd_iterations: int | None = None
 
 
 def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
@@ -129,6 +153,23 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             enable_corruption=a.obs_noise,
         ),
     }
+    if a.terrain not in ("none", "plane", "mixed"):
+        raise ValueError(f"unknown terrain {a.terrain!r}")
+    terrain_kwargs = {}
+    if a.terrain != "none":
+        # The scan noise model (latency, offsets, dropout) lives in the command (shared with the imagination).
+        observations["terrain"] = ObservationGroupCfg(
+            terms={"scan": ObservationTermCfg(func=sm_obs.terrain_scan, params={"command_name": "motion"})},
+            concatenate_terms=True,
+            enable_corruption=False,
+        )
+        terrain_kwargs = dict(
+            terrain=a.terrain,
+            terrain_level=a.terrain_level,
+            terrain_map=TerrainMapCfg(res=a.terrain_res, cache_dir=a.terrain_cache_dir),
+            scan_noise=a.scan_noise if (a.obs_noise or a.scan_noise_always) else ScanNoiseCfg(enabled=False),
+            spawn_margin=a.spawn_margin,
+        )
 
     # ---------------------------------------------------------------- actions
     actions = {
@@ -160,6 +201,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             sampling_mode=a.sampling_mode,  # type: ignore[arg-type]
             compact_library=a.compact_library,
             debug_vis=a.debug_vis,
+            **terrain_kwargs,
             **a.extra_command_kwargs,
         )
     }
@@ -233,8 +275,17 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         from mjlab.asset_zoo.robots.unitree_g1.g1_constants import FULL_COLLISION_WITHOUT_SELF
 
         robot_cfg.collisions = (FULL_COLLISION_WITHOUT_SELF,)
+    if a.terrain == "mixed":
+        from supermimic.terrain import make_terrain_generator_cfg
+
+        gen = make_terrain_generator_cfg("mixed", seed=a.terrain_seed, size=a.terrain_size, num_rows=a.terrain_rows, border=a.terrain_border)
+        terrain = TerrainEntityCfg(terrain_type="generator", terrain_generator=gen)
+        robot_cfg.spec_fn = _raised_spec_fn(robot_cfg.spec_fn)
+    else:
+        terrain = TerrainEntityCfg(terrain_type="plane")
+    mujoco_kwargs = {} if a.ccd_iterations is None else {"ccd_iterations": a.ccd_iterations}
     cfg = ManagerBasedRlEnvCfg(
-        scene=SceneCfg(terrain=TerrainEntityCfg(terrain_type="plane"), num_envs=a.num_envs, entities={"robot": robot_cfg}),
+        scene=SceneCfg(terrain=terrain, num_envs=a.num_envs, entities={"robot": robot_cfg}),
         observations=observations,
         actions=actions,
         commands=commands,
@@ -243,7 +294,11 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         terminations=terminations,
         recorders=recorders,
         viewer=ViewerConfig(origin_type=ViewerConfig.OriginType.ASSET_BODY, entity_name="robot", body_name="torso_link", distance=2.8, fovy=55.0, elevation=-5.0, azimuth=120.0),
-        sim=QuietSimulationCfg(nconmax=35, njmax=250, mujoco=MujocoCfg(timestep=0.005, iterations=10, ls_iterations=20)),
+        sim=QuietSimulationCfg(
+            nconmax=35 if a.nconmax is None else a.nconmax,
+            njmax=250 if a.njmax is None else a.njmax,
+            mujoco=MujocoCfg(timestep=0.005, iterations=10, ls_iterations=20, **mujoco_kwargs),
+        ),
         decimation=4,
         episode_length_s=a.episode_length_s,
         seed=a.seed,
@@ -251,8 +306,27 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
     return cfg
 
 
+def _raised_spec_fn(spec_fn, dz: float = 2.0):
+    """Robot spec with the floating base 2 m higher. mjlab validates the host ``MjData(model)`` (qpos0: robot at
+    the world origin) against ``nconmax``; on a grid with an odd number of rows the origin is a tile centre (e.g.
+    a pyramid top), the default pose then intersects the terrain and MuJoCo Warp refuses the model. qpos0 only
+    seeds the state before the first reset: the motion command writes every root state at reset."""
+
+    def fn():
+        spec = spec_fn()
+        root = next(b for b in spec.worldbody.bodies if b.joints and b.joints[0].type == mujoco.mjtJoint.mjJNT_FREE)
+        root.pos = [root.pos[0], root.pos[1], root.pos[2] + dz]
+        return spec
+
+    return fn
+
+
 def make_env(a: SuperMimicEnvCfgArgs, device: str = "cuda:0") -> ManagerBasedRlEnv:
     from mjlab.utils.torch import configure_torch_backends
 
     configure_torch_backends()
+    if a.terrain == "mixed" and os.environ.get("SUPERMIMIC_HFIELD_PATCH", "1") != "0":
+        from supermimic.terrain.mjwarp_patch import install_hfield_normal_filter
+
+        install_hfield_normal_filter()  # before the first step: mjlab captures the CUDA graphs then
     return ManagerBasedRlEnv(make_env_cfg(a), device=device)

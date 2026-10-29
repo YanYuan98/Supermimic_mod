@@ -71,12 +71,17 @@ class RunningNorm(nn.Module):
 
 
 class DynamicsMLP(nn.Module):
-    """delta = f(canonical(s), a, xi_norm) -> (…, 70). Zero-initialised last layer (identity dynamics at init)."""
+    """delta = f(canonical(s), a, xi_norm [, c_t]) -> (…, 70). Zero-initialised last layer (identity dynamics
+    at init). The terrain condition c_t (``terr_dim`` > 0, already normalised) is appended after ``in_norm``."""
 
-    def __init__(self, feat_dim: int = 71, act_dim: int = 29, xi_dim: int = 33, hidden=(2048, 2048, 2048), out_dim: int = 70, layer_norm: bool = False):
+    def __init__(self, feat_dim: int = 71, act_dim: int = 29, xi_dim: int = 33, hidden=(2048, 2048, 2048), out_dim: int = 70, layer_norm: bool = False, terr_dim: int = 0):
         super().__init__()
-        self.mlp = MLP(feat_dim + act_dim + xi_dim, tuple(hidden), out_dim, zero_last=True, layer_norm=layer_norm)
+        self.terr_dim = terr_dim
+        self.mlp = MLP(feat_dim + act_dim + xi_dim + terr_dim, tuple(hidden), out_dim, zero_last=True, layer_norm=layer_norm)
 
-    def forward(self, feat: torch.Tensor, action: torch.Tensor, xi_norm: torch.Tensor, in_norm: RunningNorm | None = None) -> torch.Tensor:
+    def forward(self, feat: torch.Tensor, action: torch.Tensor, xi_norm: torch.Tensor, in_norm: RunningNorm | None = None, terr: torch.Tensor | None = None) -> torch.Tensor:
         x = torch.cat([feat, action, xi_norm], dim=-1)
-        return self.mlp(in_norm(x) if in_norm is not None else x)
+        x = in_norm(x) if in_norm is not None else x
+        if terr is not None:
+            x = torch.cat([x, terr], dim=-1)
+        return self.mlp(x)

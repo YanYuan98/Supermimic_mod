@@ -8,6 +8,9 @@ Hook usage (see ``mjlab/managers/recorder_manager.py``):
 * ``record_pre_reset(ids)``   terminal step: write the last transition row plus a *terminal* row
                               holding s_{T+1} with its termination label; qpos/qvel are final here
                               even though derived kinematics are one substep stale.
+
+Each row also stores the episode origin ``env.scene.env_origins`` (terrain: the command rewrites it at
+every reset, which runs after ``record_pre_reset``, so the terminal row keeps the old origin).
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ class ReplayRecorder(RecorderTerm):
         self.buffer = ReplayBuffer(n, int(p["capacity"]), STATE_DIM, 29, XI_DIM, env.device)
         self.prev_s = torch.zeros(n, STATE_DIM, device=env.device)
         self.prev_xi = torch.zeros(n, XI_DIM, device=env.device)
+        self.prev_origin = torch.zeros(n, 3, device=env.device)
         self.prev_frame = torch.zeros(n, dtype=torch.long, device=env.device)
         self.prev_clip = torch.zeros(n, dtype=torch.long, device=env.device)
         self.ep_start = torch.ones(n, dtype=torch.bool, device=env.device)
@@ -56,6 +60,7 @@ class ReplayRecorder(RecorderTerm):
         cmd = self.command
         self.prev_s[ids] = self.state_io.read()[ids]
         self.prev_xi[ids] = self.ctx.read()[ids]
+        self.prev_origin[ids] = self.state_io.origins[ids]
         self.prev_frame[ids] = cmd.frame[ids]
         self.prev_clip[ids] = cmd.library.frame_clip[cmd.frame[ids]]
 
@@ -79,6 +84,7 @@ class ReplayRecorder(RecorderTerm):
             clip=self.prev_clip[ids],
             terminal=torch.zeros_like(done_next, dtype=torch.bool),
             ep_start=self.ep_start[ids],
+            origin=self.prev_origin[ids],
         )
         self.ep_start[ids] = False
 
@@ -104,6 +110,7 @@ class ReplayRecorder(RecorderTerm):
             clip=cmd.library.frame_clip[cmd.frame[env_ids]],
             terminal=torch.ones(env_ids.numel(), dtype=torch.bool, device=env.device),
             ep_start=torch.zeros(env_ids.numel(), dtype=torch.bool, device=env.device),
+            origin=self.state_io.origins[env_ids],  # still the finished episode's origin (reset runs next)
         )
         self.buffer.end_episode(env_ids)
 

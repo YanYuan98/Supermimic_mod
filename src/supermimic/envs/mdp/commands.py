@@ -8,6 +8,16 @@ functions work unchanged, plus:
 * ``root_*``      reference pelvis quantities for the paper's root terminations
 * ``clip_end``    (N,) True once the clip's last frame has been reached (time-out)
 * return-based reset sampling over 1 s bins of the whole library (plan D14)
+
+Terrain (``cfg.terrain`` = plane | mixed, docs/VISION_TERRAIN_PLAN.md §2.2-2.3): the command owns the
+``TerrainMap`` (rasterised in ``__init__``: the observation manager evaluates the ``terrain`` observation
+at construction) and the policy scan history + per-episode scan noise. On ``mixed`` every reset also
+samples the tile (column ~ type proportions, row ~ U{0..L}) and a spawn that keeps the reference path in
+the tile, writes the episode origin o_ep = (p_spawn.xy - lib_root_xy(start), 0) into
+``env.scene.env_origins`` (the single owner of the reference-to-world translation; ``StateIO`` and the
+recorder read it live), lifts the spawn so no sole point penetrates the terrain, and lifts the
+reference by the blurred ground under its root (``body_pos_w`` / ``root_pos_w`` / ``anchor_pos_w``, the
+same ``reference_lift`` the world model and the imagination use). ``none`` is main's code path.
 """
 
 from __future__ import annotations
@@ -29,11 +39,37 @@ from mjlab.utils.lab_api.math import (
 )
 
 from supermimic.envs.mdp.motion_library import MotionLibrary
+from supermimic.terrain.heightmap import ScanNoiseCfg, TerrainMapCfg
 
 if TYPE_CHECKING:
     from mjlab.entity import Entity
     from mjlab.envs import ManagerBasedRlEnv
+    from mjlab.terrains.terrain_generator import TerrainGeneratorCfg
     from mjlab.viewer.debug_visualizer import DebugVisualizer
+
+    from supermimic.terrain.heightmap import TerrainMap
+
+
+def build_terrain_map(mj_model, gen_cfg: TerrainGeneratorCfg | None, device, cfg: TerrainMapCfg) -> TerrainMap:
+    """``TerrainMap.build`` that rasterises once per node under torchrun: local rank 0 builds and writes the
+    disk cache, everybody waits at a barrier, the other ranks then load the cached map."""
+    import os
+
+    import torch.distributed as dist
+
+    from supermimic.terrain.heightmap import TerrainMap
+
+    if gen_cfg is None or not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
+        return TerrainMap.build(mj_model, gen_cfg, device, cfg)
+    if cfg.cache_dir is None:
+        raise ValueError("multi-GPU terrain needs the raster cache (TerrainMapCfg.cache_dir)")
+    first = int(os.environ.get("LOCAL_RANK", dist.get_rank())) == 0
+    tmap = TerrainMap.build(mj_model, gen_cfg, device, cfg) if first else None
+    dist.barrier()
+    if tmap is None:
+        tmap = TerrainMap.build(mj_model, gen_cfg, device, cfg)
+        assert tmap.info.get("cache_hit"), "rank > 0 should load the terrain map rank 0 just cached"
+    return tmap
 
 
 class MultiClipMotionCommand(CommandTerm):
@@ -61,6 +97,7 @@ class MultiClipMotionCommand(CommandTerm):
         n = self.num_envs
         self.frame = torch.zeros(n, dtype=torch.long, device=self.device)
         self.clip_end = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self._init_terrain(env)
         self._refresh_ref()
         self.body_pos_relative_w = torch.zeros(n, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(n, len(cfg.body_names), 4, device=self.device)
@@ -82,12 +119,138 @@ class MultiClipMotionCommand(CommandTerm):
                   "error_joint_pos", "error_joint_vel", "sampling_entropy", "episode_return_to_go"):
             self.metrics[k] = torch.zeros(n, device=self.device)
 
+    # ------------------------------------------------------------------ terrain
+
+    def _init_terrain(self, env: ManagerBasedRlEnv) -> None:
+        cfg = self.cfg
+        self.tmap = None  # TerrainMap (plane | mixed)
+        self.layout = None  # TerrainLayout (mixed only)
+        self._dz = None  # (N, 3) reference lift [0, 0, lift(frame)] (mixed only)
+        if cfg.terrain == "none":
+            return
+        if cfg.terrain not in ("plane", "mixed"):
+            raise ValueError(f"unknown terrain {cfg.terrain!r}")
+        # o_ep must stay fixed within an episode: no mid-episode command resampling.
+        assert min(cfg.resampling_time_range) >= env.cfg.episode_length_s, cfg.resampling_time_range
+        from supermimic.data.motion_convert import load_g1_model
+        from supermimic.kinematics.g1_fk import G1Kinematics
+        from supermimic.terrain import default_window_frames, path_bbox, sample_scan_noise
+        from supermimic.terrain.heightmap import SCAN_DIM
+
+        n = self.num_envs
+        self.fk = G1Kinematics(load_g1_model(), device=self.device)
+        gen_cfg = env.scene.terrain.cfg.terrain_generator if cfg.terrain == "mixed" else None
+        self.tmap = build_terrain_map(env.sim.mj_model, gen_cfg, self.device, cfg.terrain_map)
+        # Policy scan: history of the scans at the episode's shifted query points + per-episode noise.
+        self.scan_hist = torch.zeros(cfg.scan_noise.history_len, n, SCAN_DIM, device=self.device)
+        self.scan_noise = sample_scan_noise(n, cfg.scan_noise, self.device)
+        self._scan_reset = torch.ones(n, dtype=torch.bool, device=self.device)
+        if cfg.terrain == "plane":
+            return
+        self.layout = self.tmap.layout
+        self.layout.check_origins(env.scene.terrain.terrain_origins)
+        self.terrain_level = int(cfg.terrain_level)
+        self.path_bbox = path_bbox(self.library, default_window_frames(env.cfg.episode_length_s, cfg.spawn_horizon))
+        self.ep_row = torch.zeros(n, dtype=torch.long, device=self.device)
+        self.ep_col = torch.zeros(n, dtype=torch.long, device=self.device)
+        # Evaluation hook: (row, col) >= 0 pins the next reset's tile and centres the reference path in it.
+        self.forced_tile = torch.full((n, 2), -1, dtype=torch.long, device=self.device)
+        # Finished-episode statistics per column: [normalised return sum, episodes, failures]; one copy for
+        # the curriculum (reset at each level check), one for logging (reset at each log).
+        self.terrain_stats_curriculum = torch.zeros(3, self.layout.num_cols, device=self.device)
+        self.terrain_stats_log = torch.zeros(3, self.layout.num_cols, device=self.device)
+        self.spawn_misfit = torch.zeros((), dtype=torch.long, device=self.device)  # paths that did not fit their tile
+        self._dz = torch.zeros(n, 3, device=self.device)
+        env.scene.env_origins[:, 2] = 0.0  # o_ep.z = 0 (mjlab initialises the origins at the tile spawn z)
+
+    @property
+    def policy_scan(self) -> torch.Tensor:
+        """(N, 187) noisy, delayed policy height scan (the ``terrain`` observation)."""
+        from supermimic.terrain import noisy_scan
+
+        return noisy_scan(self.scan_hist, self.scan_noise, self.cfg.scan_noise)
+
+    def _update_scan(self, env_ids: torch.Tensor | None) -> None:
+        """Push the scan of the current state (qpos is fresh: called after ``sim.forward()``) into the
+        policy scan history; envs flagged at reset get their whole history filled with it (lag 0 = current)."""
+        from supermimic.terrain import push_scan
+
+        q = self._env.sim.data.qpos[:]
+        ids = slice(None) if env_ids is None else env_ids
+        root = q[ids, 0:7]
+        scan = self.tmap.scan(root[:, 0:3], root[:, 3:7], xy_shift=self.scan_noise.offset_xy[ids])
+        hist = self.scan_hist[:, ids]
+        new = torch.where(self._scan_reset[ids][None, :, None], scan[None].expand_as(hist), push_scan(hist, scan))
+        if env_ids is None:
+            self.scan_hist.copy_(new)
+        else:
+            self.scan_hist[:, env_ids] = new
+        self._scan_reset[ids] = False
+        if self.layout is not None and env_ids is None:
+            self.tmap.count_out_of_bounds(root[:, 0:2])  # env-steps with the pelvis off the rasterised map
+
+    def _reset_scan(self, env_ids: torch.Tensor) -> None:
+        from supermimic.terrain import resample_scan_noise_
+
+        resample_scan_noise_(self.scan_noise, env_ids, self.cfg.scan_noise)
+        self._scan_reset[env_ids] = True
+
+    def _place(self, env_ids: torch.Tensor, frames: torch.Tensor, row: torch.Tensor, col: torch.Tensor, centred: torch.Tensor) -> torch.Tensor:
+        """Choose the tile + spawn of new episodes and write o_ep into ``env.scene.env_origins``; (k, 3)."""
+        from supermimic.terrain import sample_spawn
+
+        sp = sample_spawn(self.library, frames, self.path_bbox, self.layout, self.terrain_level, self.cfg.spawn_margin, row=row, col=col, centred=centred)
+        self._env.scene.env_origins[env_ids] = sp.origin
+        self.ep_row[env_ids] = sp.row
+        self.ep_col[env_ids] = sp.col
+        self.spawn_misfit += (~sp.fits).sum()
+        return sp.origin
+
+    def _lifted_spawn(self, env_ids: torch.Tensor, root_pos: torch.Tensor, root_ori: torch.Tensor, joint_pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Root position of a (noised) reference spawn lifted clear of the terrain (plan §2.2) and the clipped
+        joints; ``root_pos`` is world-frame and already includes the reference lift of the start frame."""
+        from supermimic.terrain import spawn_lift
+
+        soft = self.robot.data.soft_joint_pos_limits[env_ids]
+        joint_pos = torch.clip(joint_pos, soft[:, :, 0], soft[:, :, 1])
+        origin = self._env.scene.env_origins[env_ids]
+        qpos = torch.cat([root_pos - origin, root_ori, joint_pos], dim=-1)
+        root_pos = root_pos.clone()
+        root_pos[:, 2] += spawn_lift(qpos, origin, self.fk, self.tmap)
+        return root_pos, joint_pos
+
+    def _track_terrain_episodes(self, env_ids: torch.Tensor) -> None:
+        """Fold the finished episodes of ``env_ids`` (normalised return over the survived steps, failure =
+        terminated) into the per-column statistics of their tile (curriculum + logging). Host-sync free.
+
+        Episodes that reached the clip end in fewer than ``terrain_stats_min_steps`` steps without failing are left
+        out: the return sampler starts ~40% of all episodes in the bin with the lowest return-to-go, which is
+        always some clip's last bin (no bootstrap past a clip end). Those few-step post-reset episodes lowered the
+        mean return by an amount that depends on which clip's last bin won (Phase D, same frozen policy: 0.67 vs
+        0.76 per-episode means; 0.81 / 0.82 without them) and diluted the failure rate (logging-window means
+        0.01-0.08 vs 0.11)."""
+        lens = self.ep_len[env_ids]
+        valid = torch.arange(self.max_ep_steps, device=self.device)[None, :] < lens[:, None]
+        ret = (self.ep_rewards[env_ids] * valid).sum(-1) / (self.cfg.max_step_reward * lens.clamp_min(1))
+        tm = getattr(self._env, "termination_manager", None)
+        failed = tm.terminated[env_ids].float() if tm is not None else torch.zeros_like(ret)
+        short_clip_end = self.clip_end[env_ids] & (failed == 0) & (lens < self.cfg.terrain_stats_min_steps)
+        done = ((lens > 0) & ~short_clip_end).float()
+        add = torch.stack([ret * done, done, failed * done])  # (3, k)
+        col = self.ep_col[env_ids]
+        for stats in (self.terrain_stats_curriculum, self.terrain_stats_log):
+            stats.index_add_(1, col, add)
+
     # ------------------------------------------------------------------ reference (mjlab MotionCommand API)
 
     def _refresh_ref(self) -> None:
-        """Cache the reference state / tracked-body states of the current target frames."""
+        """Cache the reference state / tracked-body states of the current target frames (+ terrain lift)."""
         self._ref = self.library.ref(self.frame)
         self._bodies = self.library.bodies(self.frame)
+        if self._dz is not None:
+            from supermimic.terrain import reference_lift
+
+            self._dz[:, 2] = reference_lift(self.library, self.frame, self._env.scene.env_origins, self.tmap)
 
     @property
     def command(self) -> torch.Tensor:
@@ -107,7 +270,8 @@ class MultiClipMotionCommand(CommandTerm):
 
     @property
     def body_pos_w(self) -> torch.Tensor:
-        return self._bodies.pos_w + self._env.scene.env_origins[:, None, :]
+        p = self._bodies.pos_w + self._env.scene.env_origins[:, None, :]
+        return p if self._dz is None else p + self._dz[:, None, :]
 
     @property
     def body_quat_w(self) -> torch.Tensor:
@@ -123,7 +287,8 @@ class MultiClipMotionCommand(CommandTerm):
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:
-        return self._bodies.pos_w[:, self.motion_anchor_body_index] + self._env.scene.env_origins
+        p = self._bodies.pos_w[:, self.motion_anchor_body_index] + self._env.scene.env_origins
+        return p if self._dz is None else p + self._dz
 
     @property
     def anchor_quat_w(self) -> torch.Tensor:
@@ -131,7 +296,8 @@ class MultiClipMotionCommand(CommandTerm):
 
     @property
     def root_pos_w(self) -> torch.Tensor:
-        return self._ref.root_pos_w + self._env.scene.env_origins
+        p = self._ref.root_pos_w + self._env.scene.env_origins
+        return p if self._dz is None else p + self._dz
 
     @property
     def root_quat_w(self) -> torch.Tensor:
@@ -287,6 +453,8 @@ class MultiClipMotionCommand(CommandTerm):
         mask[env_ids] = True
         if self.ep_len.sum() > 0 or hasattr(self._env, "reward_buf"):
             self._log_step_rewards(mask)
+            if self.layout is not None:
+                self._track_terrain_episodes(env_ids)
             self._finalize_episodes(env_ids)
         self.ep_len[env_ids] = 0
 
@@ -296,7 +464,12 @@ class MultiClipMotionCommand(CommandTerm):
         self.clip_end[env_ids] = False
 
         r = self.library.ref(self.frame[env_ids])
+        if self.layout is not None:
+            tile = self.forced_tile[env_ids]
+            self._place(env_ids, self.frame[env_ids], tile[:, 0], tile[:, 1], centred=tile[:, 0] >= 0)
         root_pos = r.root_pos_w + self._env.scene.env_origins[env_ids]
+        if self.layout is not None:
+            root_pos[:, 2] += self.tmap.ground(root_pos[:, 0:2])  # reference lift of the start frame
         root_ori = r.root_quat_w.clone()
         root_lin_vel = r.root_lin_vel_w.clone()
         root_ang_vel = r.root_ang_vel_w.clone()
@@ -315,8 +488,12 @@ class MultiClipMotionCommand(CommandTerm):
         lo, hi = self.cfg.joint_position_range
         if hi > lo:
             joint_pos = joint_pos + sample_uniform(lo, hi, joint_pos.shape, device=self.device)
+        if self.layout is not None:
+            root_pos, joint_pos = self._lifted_spawn(env_ids, root_pos, root_ori, joint_pos)
 
         self._write_reference_state_to_sim(env_ids, root_pos, root_ori, root_lin_vel, root_ang_vel, joint_pos, joint_vel)
+        if self.tmap is not None:
+            self._reset_scan(env_ids)
 
     def update_relative_body_poses(self) -> None:
         nb = len(self.cfg.body_names)
@@ -348,16 +525,29 @@ class MultiClipMotionCommand(CommandTerm):
             self.frame = torch.where(over, last, self.frame)
         self._refresh_ref()
         self.update_relative_body_poses()
+        if self.tmap is not None:
+            self._update_scan(env_ids)
 
     def reset_to_frame(self, env_ids: torch.Tensor, frame: torch.Tensor) -> None:
-        """Deterministic reset to exact reference frames (no noise); used by evaluation."""
+        """Deterministic reset to exact reference frames (no noise); used by evaluation. On ``mixed`` the
+        reference path is centred in the ``forced_tile`` (or the env's current tile)."""
         self.ep_len[env_ids] = 0
         self.frame[env_ids] = frame
         self.clip_end[env_ids] = False
         r = self.library.ref(frame)
-        self._write_reference_state_to_sim(
-            env_ids, r.root_pos_w + self._env.scene.env_origins[env_ids], r.root_quat_w, r.root_lin_vel_w, r.root_ang_vel_w, r.joint_pos, r.joint_vel
-        )
+        joint_pos = r.joint_pos
+        if self.layout is not None:
+            tile = self.forced_tile[env_ids]
+            row = torch.where(tile[:, 0] >= 0, tile[:, 0], self.ep_row[env_ids])
+            col = torch.where(tile[:, 1] >= 0, tile[:, 1], self.ep_col[env_ids])
+            self._place(env_ids, frame, row, col, centred=torch.ones_like(row, dtype=torch.bool))
+        root_pos = r.root_pos_w + self._env.scene.env_origins[env_ids]
+        if self.layout is not None:
+            root_pos[:, 2] += self.tmap.ground(root_pos[:, 0:2])
+            root_pos, joint_pos = self._lifted_spawn(env_ids, root_pos, r.root_quat_w, joint_pos)
+        self._write_reference_state_to_sim(env_ids, root_pos, r.root_quat_w, r.root_lin_vel_w, r.root_ang_vel_w, joint_pos, r.joint_vel)
+        if self.tmap is not None:
+            self._reset_scan(env_ids)
 
     # ------------------------------------------------------------------ debug visualization (viewer only)
 
@@ -422,6 +612,15 @@ class MultiClipMotionCommandCfg(CommandTermCfg):
     compact_library: bool = False
     library_fp16: bool = True
     resampling_time_range: tuple[float, float] = (1.0e9, 1.0e9)
+    # Terrain (VISION_TERRAIN_PLAN): "none" = main's code path | "plane" | "mixed" (scene terrain generator).
+    terrain: str = "none"
+    terrain_level: int = 2  # initial curriculum level L (spawn rows ~ U{0..L})
+    terrain_map: TerrainMapCfg = field(default_factory=TerrainMapCfg)
+    scan_noise: ScanNoiseCfg = field(default_factory=ScanNoiseCfg)  # policy scan corruption (disabled for evaluation)
+    spawn_margin: float = 0.5  # m between the reference path bbox and the tile edge
+    spawn_horizon: int = 32  # the spawn bbox covers one episode + this many frames (imagination horizon)
+    max_step_reward: float = 0.1  # normalisation of the terrain-episode returns (curriculum)
+    terrain_stats_min_steps: int = 100  # shorter non-failed clip-end episodes are not counted (see _track_terrain_episodes)
 
     def build(self, env: ManagerBasedRlEnv) -> MultiClipMotionCommand:
         return MultiClipMotionCommand(self, env)

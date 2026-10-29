@@ -4,7 +4,8 @@ and how much of the world-frame velocity error is just that drift (yaw misalignm
   uv run python scripts/diag_drift.py --ckpt logs/e7/ckpt_0020000.pt --npz-dir data/npz/lafan1
 
 Same deterministic protocol as eval_benchmark (first frame start, no noise/DR). Each clip plays once in
-its own env. Reports per-clip and aggregate:
+its own env (terrain checkpoints: on the plane, or ``--terrain mixed --terrain-col C --terrain-row R``
+centred in that tile). Reports per-clip and aggregate:
   * mean / final anchor xy error [m] and |yaw error| [deg], time until xy error > 0.3 m and |yaw| > 15 deg
   * body linear-velocity error: world frame (what the reward sees) vs after rotating the robot's velocities
     by the yaw error (drift removed) -> the residual is the genuine velocity-tracking error.
@@ -15,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+from typing import Literal
 
 import torch
 import tyro
@@ -23,7 +25,7 @@ from mjlab.utils.lab_api.math import quat_apply, quat_inv, quat_mul, wrap_to_pi,
 from supermimic.goal_spec import anchor_mode
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.envs.mdp.motion_library import discover_npz
-from supermimic.eval.benchmark import load_policy_from_checkpoint
+from supermimic.eval.benchmark import EVAL_TERRAIN_SEED, act, load_policy_from_checkpoint, terrain_env_kwargs_for_eval
 
 
 def _yaw(q: torch.Tensor) -> torch.Tensor:
@@ -32,20 +34,29 @@ def _yaw(q: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def main(ckpt: Path, npz_dir: Path = Path("data/npz/lafan1"), clips: list[str] | None = None, device: str = "cuda:0", out: Path | None = None) -> None:
+def main(
+    ckpt: Path, npz_dir: Path = Path("data/npz/lafan1"), clips: list[str] | None = None, device: str = "cuda:0", out: Path | None = None,
+    terrain: Literal["none", "plane", "mixed"] | None = None, terrain_seed: int = EVAL_TERRAIN_SEED, terrain_col: str = "flat", terrain_row: int = 0,
+) -> None:  # fmt: skip
     files = [str(f) for f in discover_npz(npz_dir, names=clips)]
     policy, cfg = load_policy_from_checkpoint(ckpt, device)
+    if terrain is None:
+        terrain = "plane" if policy.terrain is not None else "none"
     n = len(files)
     args = SuperMimicEnvCfgArgs(
         npz_files=files, num_envs=n, future_frames=cfg["env"]["future_frames"], episode_length_s=1.0e5,
         action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False,
         sampling_mode="start", record_transitions=False, seed=0, anchor_obs=anchor_mode(cfg["env"].get("anchor_obs", False)), goal_features=cfg["env"].get("goal_features", "v1"), self_collision=cfg["env"].get("self_collision", True),
+        **terrain_env_kwargs_for_eval(cfg, terrain, terrain_seed),
     )
     env = make_env(args, device=device)
     try:
         cmd = env.command_manager.get_term("motion")
         lib = cmd.library
         cmd.forced_frame[:] = lib.clip_start[torch.arange(n, device=device)]
+        if terrain == "mixed":
+            cmd.forced_tile[:, 0] = terrain_row
+            cmd.forced_tile[:, 1] = cmd.layout.col_index(terrain_col)
         obs, _ = env.reset()
         cmd.forced_frame[:] = -1
         dt = env.step_dt
@@ -90,8 +101,7 @@ def main(ckpt: Path, npz_dir: Path = Path("data/npz/lafan1"), clips: list[str] |
             sum_w_world += ew_w * a
             sum_w_aligned += ew_a * a
             steps += a
-            act = policy(obs["policy"], obs["goal"])
-            obs, _, term, tout, _ = env.step(act)
+            obs, _, term, tout, _ = env.step(act(policy, obs))
             done = (term | tout) & active
             failed |= term & active
             active &= ~done

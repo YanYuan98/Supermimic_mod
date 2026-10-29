@@ -83,6 +83,14 @@ def allreduce_buffers(module: torch.nn.Module) -> None:
             dist.all_reduce(b.data, op=dist.ReduceOp.AVG)
 
 
+@torch.no_grad()
+def allreduce_sum_(t: torch.Tensor) -> torch.Tensor:
+    """In-place sum of a tensor across ranks (no-op on one rank)."""
+    if world_size() > 1:
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return t
+
+
 def allreduce_mean(x: float) -> float:
     if world_size() == 1:
         return x

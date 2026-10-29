@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from supermimic.imagination.policy_trainer import PolicyTrainerCfg
 from supermimic.policy.nets import CriticCfg, PolicyCfg
+from supermimic.terrain.heightmap import ScanNoiseCfg
 from supermimic.world_model.wm_trainer import WMTrainerCfg
 from supermimic.world_model.world_model import WorldModelCfg
 
@@ -57,6 +59,56 @@ class ScheduleCfg:
     log_interval: int = 50  # iterations
     checkpoint_interval: int = 4000  # iterations
     max_hours: float | None = None
+    # World-model-only training (VISION_TERRAIN_PLAN M2): the policy collects data but is frozen (no
+    # policy / critic updates, input normalisers not updated); the world model keeps training.
+    wm_only: bool = False
+
+
+@dataclass
+class TerrainCurriculumCfg:
+    """Global difficulty level L (plan §2.7): spawn rows ~ U{0..L}; L += 1 when the terrain episodes
+    finished since the last check have mean normalised return > promote_return and failure rate < promote_max_fail."""
+
+    start_level: int = 2
+    check_every: int = 2000  # iterations
+    # Terrain-episode statistics exclude short clip-end episodes (MultiClipMotionCommand._track_terrain_episodes).
+    # Frozen flat policy, means of the 50-iteration logging windows: L = 2 return 0.82 (flat column 0.87), L = 9 0.75;
+    # the pooled failure rate of a 2000-iteration check is lower than the window means (time-out waves).
+    promote_return: float = 0.75
+    promote_max_fail: float = 0.10
+    min_episodes: int = 200  # summed over ranks; fewer -> no decision at this check
+
+
+@dataclass
+class TerrainCfg:
+    """Terrain + height-scan extension (docs/VISION_TERRAIN_PLAN.md).
+
+    kind: "none" = main's flat environment, no terrain inputs anywhere (default); "plane" = the
+    terrain-capable models (policy scan, critic / world-model terrain features) on mjlab's flat plane
+    (regression); "mixed" = the 9-column x ``num_rows`` curriculum grid of plan §2.7 with spawn sampling,
+    reference lift and the difficulty curriculum."""
+
+    kind: Literal["none", "plane", "mixed"] = "none"
+    seed: int = 0  # terrain generator seed; explicit so every rank builds the same map
+    # World-model terrain condition (plan §0): foot (28) | scan (187) | both (215) | none (flat WM) | foot_fine (80:
+    # 5 x 3 sole clearances + 5 x 5 patch at 5 cm per foot, plan §7 mitigation).
+    wm_terrain: Literal["none", "foot", "scan", "both", "foot_fine"] = "foot"
+    scan_noise: ScanNoiseCfg = field(default_factory=ScanNoiseCfg)  # policy scan only (sim + imagination)
+    grad: bool = False  # True: let gradients flow through the terrain slope (bilinear weights); default detached
+    curriculum: TerrainCurriculumCfg = field(default_factory=TerrainCurriculumCfg)
+    size: float = 12.0  # tile edge, m
+    num_rows: int = 10  # difficulty rows
+    border: float = 4.0  # flat outer border, m
+    res: float = 0.025  # height-map resolution, m
+    spawn_margin: float = 0.5  # m kept between the reference path bbox and the tile edge
+    # MuJoCo Warp capacities for "mixed" (plane / none keep main's 250 / 35 / 50). mjlab's G1 rough velocity
+    # task uses njmax 1500 / nconmax 70 / ccd_iterations 500. Measured with 4096 envs (flat policy, L = 2 and 9):
+    # max nefc 187, ~9 contacts per world, no nefc / contact / ccd / hfield / epa overflow at 600 / 70 / 50..500;
+    # the EPA work buffers scale with ccd_iterations (Warp memory 7 / 9 / 24 GB at 50 / 100 / 500), and 500 does
+    # not fit next to the imagination on a 32 GB GPU. Rollout outcomes did not change between 50 and 500.
+    njmax: int = 600
+    nconmax: int = 70
+    ccd_iterations: int = 100
 
 
 @dataclass
@@ -73,5 +125,31 @@ class TrainConfig:
     critic: CriticCfg = field(default_factory=CriticCfg)
     policy_trainer: PolicyTrainerCfg = field(default_factory=PolicyTrainerCfg)
     schedule: ScheduleCfg = field(default_factory=ScheduleCfg)
+    terrain: TerrainCfg = field(default_factory=TerrainCfg)
     resume: Path | None = None
+    # Warm start from a (flat) checkpoint: weights + normalisers only, new terrain input columns of the
+    # policy decoder / critic / world model zero-initialised, new modules fresh, optimisers fresh, iteration 0.
+    init_from: Path | None = None
     amp: str = "bf16"  # "bf16" (autocast for MLP matmuls; ~31% faster on RTX 5090) | "none" (TF32 matmuls, as in the paper)
+
+
+def terrain_env_kwargs(tcfg) -> dict:
+    """``SuperMimicEnvCfgArgs`` terrain fields from a ``TerrainCfg`` (or its dict from a checkpoint config);
+    {} for kind "none" (main's environment). The MuJoCo Warp capacity overrides apply to "mixed" only."""
+    t = tcfg if isinstance(tcfg, dict) else asdict(tcfg)
+    if t.get("kind", "none") == "none":
+        return {}
+    out = dict(
+        terrain=t["kind"],
+        terrain_seed=t["seed"],
+        terrain_size=t["size"],
+        terrain_rows=t["num_rows"],
+        terrain_border=t["border"],
+        terrain_res=t["res"],
+        terrain_level=t["curriculum"]["start_level"],
+        spawn_margin=t["spawn_margin"],
+        scan_noise=ScanNoiseCfg(**t["scan_noise"]),
+    )
+    if t["kind"] == "mixed":
+        out.update(njmax=t["njmax"], nconmax=t["nconmax"], ccd_iterations=t["ccd_iterations"])
+    return out

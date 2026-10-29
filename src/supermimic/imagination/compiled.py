@@ -9,15 +9,27 @@ The rollout is split the way supermimic_vibed does it, which minimises kernel la
   (H+1)·n imagined states: full-body FK, reward, termination logits and the critic's privileged
   tracking errors. Gradients reach every state through the stacked tensors exactly as if they
   were computed step by step (the policy's actions never depend on rewards).
+
+Terrain (docs/VISION_TERRAIN_PLAN.md §2.6, ``terrain`` given): every step looks the policy scan up at the
+episode's shifted points, pushes it into the scan history and corrupts it (latency, offsets, point noise,
+dropout: the sim's noise model, only on the policy's copy), while the world model gets the noise-free
+condition of the current predicted state. ``ImagHeads`` additionally returns the critic's noise-free
+terrain features and the ground height for all (H+1)·n states. Without ``terrain`` both run main's graphs.
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from supermimic.goal_spec import anchor_mode
+from supermimic.terrain.heightmap import noisy_scan, push_scan
 from supermimic.world_model.heads import ReferenceFrame, analytic_observation, anchor_relative_obs, flatten_history_term_major
 from supermimic.world_model.world_model import WorldModel
+
+if TYPE_CHECKING:
+    from supermimic.terrain.inputs import TerrainInputs
 
 REWARD_TERM_NAMES = (
     "motion_global_root_pos",
@@ -45,7 +57,7 @@ def _compile(fn, mode: str | None):
 class ImagStep:
     """(s_t, noisy obs history, reference goal part of g_t, reference anchor) -> (s_{t+1}, a_t, history', g_t)."""
 
-    def __init__(self, wm: WorldModel, policy, default_joint_pos: torch.Tensor, anchor_obs: str | bool = "none", obs_noise: bool = True, compile_mode: str | None = None):
+    def __init__(self, wm: WorldModel, policy, default_joint_pos: torch.Tensor, anchor_obs: str | bool = "none", obs_noise: bool = True, compile_mode: str | None = None, *, terrain: TerrainInputs | None = None):
         self.wm, self.policy, self.q0 = wm, policy, default_joint_pos
         self.mode = anchor_mode(anchor_obs)
         self.obs_noise = obs_noise
@@ -54,7 +66,13 @@ class ImagStep:
         self.anchor_noise_half = ANCHOR_NOISE_HALF[self.mode].to(dev) if self.mode != "none" else None
         heads = wm.heads
         self.torso = int(heads.tracked_idx[heads.anchor_index])  # FK body index of the anchor (torso_link)
-        self._fn = _compile(self._step, compile_mode)
+        self.terrain = terrain
+        if terrain is not None:
+            from dataclasses import replace
+
+            # Policy-side scan corruption follows the observation-noise switch (like the sim's obs_noise).
+            self.scan_noise = terrain.scan_noise if obs_noise else replace(terrain.scan_noise, enabled=False)
+        self._fn = _compile(self._step if terrain is None else self._step_terrain, compile_mode)
         self._goal_fn = _compile(self.goal, compile_mode)
 
     def noisy(self, o: torch.Tensor) -> torch.Tensor:
@@ -80,14 +98,38 @@ class ImagStep:
     def __call__(self, s, hist, goal_ref, ref_anchor_pos, ref_anchor_quat, xi):
         return self._fn(s, hist, goal_ref, ref_anchor_pos, ref_anchor_quat, xi)
 
+    def _step_terrain(self, s, hist, scan_hist, goal_ref, ref_anchor_pos, ref_anchor_quat, xi, origin, noise, grid):
+        tr = self.terrain
+        scan_hist = push_scan(scan_hist, tr.policy_scan_query(s, origin, noise, grid))  # lag 0 = current
+        scan_obs = noisy_scan(scan_hist, noise, self.scan_noise)  # noise only on the policy's copy
+        g = self.goal(s, goal_ref, ref_anchor_pos, ref_anchor_quat)
+        a = self.policy(flatten_history_term_major(hist), g, scan=scan_obs)
+        s_next = self.wm.step_at(s, a, xi, origin, grid)  # noise-free condition of s; re-queried next step
+        obs = self.noisy(analytic_observation(s_next, a, xi, self.q0))
+        return s_next, a, torch.cat([hist[1:], obs[None]], dim=0), scan_hist, g
+
+    def step_terrain(self, s, hist, scan_hist, goal_ref, ref_anchor_pos, ref_anchor_quat, xi, origin, noise, grid):
+        """-> (s_{t+1}, a_t, history', scan history', g_t); ``noise``: per-start ``ScanNoiseParams``."""
+        return self._fn(s, hist, scan_hist, goal_ref, ref_anchor_pos, ref_anchor_quat, xi, origin, noise, grid)
+
 
 class ImagHeads:
     """Batched reward / termination / critic features over a whole rollout."""
 
-    def __init__(self, wm: WorldModel, critic_features: bool = True, compile_mode: str | None = None):
+    def __init__(self, wm: WorldModel, critic_features: bool = True, compile_mode: str | None = None, *, terrain: TerrainInputs | None = None):
         self.wm = wm
         self.critic_features = critic_features
+        self.terrain = terrain
         self._fn = _compile(self._heads, compile_mode)
+        if terrain is not None:
+            self._terrain_fn = _compile(self._critic_terrain, compile_mode)
+
+    def _critic_terrain(self, states, origin, grid):
+        """Noise-free critic terrain features (H+1, n, 215) and ground height (H+1, n) of every state."""
+        return self.terrain.critic_features(states, origin[None], grid)
+
+    def critic_terrain(self, states, origin, grid):
+        return self._terrain_fn(states, origin, grid)
 
     def _heads(self, states, actions, prev_actions, ref_body_pos, ref_body_quat, ref_body_lin, ref_body_ang, ref_root_pos, ref_root_quat, ref_joint_pos):
         """states (H+1, n, 71); actions / prev_actions (H, n, 29); reference tensors for frames 0..H."""

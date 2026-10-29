@@ -13,13 +13,17 @@ class StateIO:
     def __init__(self, env):
         self.env = env
         self.sim = env.sim
-        # States are stored relative to each env's origin so that they are directly comparable
-        # with the (origin-free) motion library and translation-invariant across envs.
-        self.origins = env.scene.env_origins.clone()  # (N, 3)
         assert self.sim.data.qpos.shape[-1] == NQ and self.sim.data.qvel.shape[-1] == NV, (
             self.sim.data.qpos.shape,
             self.sim.data.qvel.shape,
         )
+
+    @property
+    def origins(self) -> torch.Tensor:
+        """(N, 3) live episode origins. States are stored relative to each env's origin so that they are
+        directly comparable with the (origin-free) motion library and translation-invariant across envs;
+        with terrain the motion command rewrites ``env_origins`` (o_ep) at every reset."""
+        return self.env.scene.env_origins
 
     def read(self) -> torch.Tensor:
         """(N, 71) copy of [qpos | qvel]."""

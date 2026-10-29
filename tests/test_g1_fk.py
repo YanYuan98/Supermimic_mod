@@ -80,6 +80,29 @@ def test_fk_cuda_matches_cpu():
         np.testing.assert_allclose(a[k].numpy(), b[k].cpu().numpy(), atol=5e-5)
 
 
+@pytest.mark.parametrize("dtype,atol", [(torch.float64, 1e-12), (torch.float32, 2e-6)])
+def test_chain_poses_matches_chain_pose(dtype, atol):
+    """Stacked two-leg chain (terrain foot features) == per-body chain_pose == full FK; fallback for unequal chains."""
+    model = load_g1_model()
+    rng = np.random.default_rng(3)
+    qpos, _ = _random_state(model, rng, 512)
+    fk = G1Kinematics(model, "cpu", dtype)
+    q = torch.as_tensor(qpos, dtype=dtype)
+    feet = (fk.body_index("left_ankle_roll_link"), fk.body_index("right_ankle_roll_link"))
+    assert fk._stacked_chain(feet) is not None  # prepared eagerly in __init__
+    pos, quat = fk.chain_poses(q, feet)
+    full = fk(q)
+    for k, b in enumerate(feet):
+        p1, q1 = fk.chain_pose(q, b)
+        np.testing.assert_allclose(pos[:, k].numpy(), p1.numpy(), atol=atol)
+        np.testing.assert_allclose(quat[:, k].numpy(), q1.numpy(), atol=atol)
+        np.testing.assert_allclose(pos[:, k].numpy(), full["pos"][:, b].numpy(), atol=atol)
+    mixed = (feet[0], fk.body_index("torso_link"))  # different chain lengths -> per-body fallback, exact
+    pm, qm = fk.chain_poses(q, mixed)
+    p1, q1 = fk.chain_pose(q, mixed[1])
+    assert torch.equal(pm[:, 1], p1) and torch.equal(qm[:, 1], q1)
+
+
 def test_fk_is_differentiable():
     model = load_g1_model()
     rng = np.random.default_rng(2)

@@ -59,12 +59,13 @@ def make_tpose_clip(out: Path, seconds: float = 20.0, fps: int = 50) -> Path:
 @torch.no_grad()
 def main(ckpt: Path, speeds: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0), num_envs: int = 256, device: str = "cuda:0", push_time_s: float = 1.0, horizon_s: float = 8.0) -> None:
     from supermimic.envs import SuperMimicEnvCfgArgs, make_env
-    from supermimic.eval.benchmark import load_policy_from_checkpoint
+    from supermimic.eval.benchmark import act, load_policy_from_checkpoint, terrain_env_kwargs_for_eval
 
     policy, cfg = load_policy_from_checkpoint(ckpt, device)
     tmp = Path(tempfile.mkdtemp()) / "tpose.npz"
     make_tpose_clip(tmp)
-    args = SuperMimicEnvCfgArgs(npz_files=[str(tmp)], num_envs=num_envs, action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False, sampling_mode="start", record_transitions=False, episode_length_s=1e5, future_frames=cfg["env"]["future_frames"], anchor_obs=anchor_mode(cfg["env"].get("anchor_obs", False)), goal_features=cfg["env"].get("goal_features", "v1"), self_collision=cfg["env"].get("self_collision", True), seed=0)
+    terrain = "plane" if policy.terrain is not None else "none"  # flat-ground protocol; terrain policies need the scan
+    args = SuperMimicEnvCfgArgs(npz_files=[str(tmp)], num_envs=num_envs, action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False, sampling_mode="start", record_transitions=False, episode_length_s=1e5, future_frames=cfg["env"]["future_frames"], anchor_obs=anchor_mode(cfg["env"].get("anchor_obs", False)), goal_features=cfg["env"].get("goal_features", "v1"), self_collision=cfg["env"].get("self_collision", True), seed=0, **terrain_env_kwargs_for_eval(cfg, terrain))
     env = make_env(args, device=device)
     robot = env.scene["robot"]
     cmd = env.command_manager.get_term("motion")
@@ -83,8 +84,7 @@ def main(ckpt: Path, speeds: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0), num_envs:
                 v[:, 1] += speed * torch.sin(ang)
                 robot.write_root_link_velocity_to_sim(v)
                 pushed = True
-            act = policy(obs["policy"], obs["goal"])
-            obs, rew, term, tout, _ = env.step(act)
+            obs, rew, term, tout, _ = env.step(act(policy, obs))
             fallen |= term
             if pushed:
                 err = torch.norm(cmd.root_pos_w - cmd.robot_root_pos_w, dim=-1)

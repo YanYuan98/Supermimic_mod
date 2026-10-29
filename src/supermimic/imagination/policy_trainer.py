@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -13,6 +14,9 @@ from supermimic.imagination.rollout import ImagRollout, imagine
 from supermimic.policy.nets import Critic, Policy
 from supermimic.training.distributed import allreduce_grads
 from supermimic.world_model.world_model import WorldModel
+
+if TYPE_CHECKING:
+    from supermimic.terrain.inputs import TerrainInputs
 
 
 @dataclass
@@ -45,26 +49,31 @@ class PolicyTrainerCfg:
 
 
 class PolicyTrainer:
-    def __init__(self, wm: WorldModel, policy: Policy, critic: Critic, lib: MotionLibrary, cfg: PolicyTrainerCfg):
+    def __init__(self, wm: WorldModel, policy: Policy, critic: Critic, lib: MotionLibrary, cfg: PolicyTrainerCfg, *, terrain: TerrainInputs | None = None):
         self.wm, self.policy, self.critic, self.lib, self.cfg = wm, policy, critic, lib, cfg
+        self.terrain = terrain
         fused = torch.cuda.is_available()
         self.opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr, betas=cfg.betas, fused=fused)
         self.critic_opt = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr, fused=fused)
         from supermimic.imagination.compiled import ImagHeads, ImagStep
 
-        self.step_fn = ImagStep(wm, policy, lib.default_joint_pos, anchor_obs=cfg.anchor_obs, obs_noise=cfg.obs_noise, compile_mode=cfg.compile)
-        self.heads_fn = ImagHeads(wm, critic_features=critic.err_dim > 4, compile_mode=cfg.compile)
+        self.step_fn = ImagStep(wm, policy, lib.default_joint_pos, anchor_obs=cfg.anchor_obs, obs_noise=cfg.obs_noise, compile_mode=cfg.compile, terrain=terrain)
+        self.heads_fn = ImagHeads(wm, critic_features=critic.err_dim > 4, compile_mode=cfg.compile, terrain=terrain)
 
-    def set_lr(self, lr: float) -> None:
+    def set_lr(self, lr: float, critic_lr: float | None = None) -> None:
+        """Policy LR ``lr``; critic LR ``critic_lr`` (None: the same as the policy)."""
         for g in self.opt.param_groups:
             g["lr"] = lr
         for g in self.critic_opt.param_groups:
-            g["lr"] = lr
+            g["lr"] = lr if critic_lr is None else critic_lr
 
     def _critic_inputs(self, ro: ImagRollout):
+        """(canonical state, goals, tracking errors, terrain features | None), each (H+1, n, ·). With terrain
+        the canonical root height is taken above the ground."""
         H1, n, _ = ro.states.shape
-        feat = self.wm.spec.canonical(ro.states.reshape(H1 * n, -1)).reshape(H1, n, -1)
-        return feat, ro.goals, ro.crit_feat
+        gz = None if ro.ground_z is None else ro.ground_z.reshape(H1 * n)
+        feat = self.wm.spec.canonical(ro.states.reshape(H1 * n, -1), ground_z=gz).reshape(H1, n, -1)
+        return feat, ro.goals, ro.crit_feat, ro.crit_terr
 
     def update(self, buffer: ReplayBuffer, xi_norm_fn=None) -> dict[str, float]:
         cfg = self.cfg
@@ -78,9 +87,9 @@ class PolicyTrainer:
         self.wm.requires_grad_(False)
         self.critic.requires_grad_(False)
         ro = imagine(self.lib, start, cfg.horizon, self.step_fn, self.heads_fn, cfg.future_frames, cfg.goal_features)
-        feat, goals, err = self._critic_inputs(ro)
+        feat, goals, err, terr = self._critic_inputs(ro)
         if cfg.use_critic:
-            v_H = self.critic(feat[-1], goals[-1], xi_norm, err[-1])
+            v_H = self.critic(feat[-1], goals[-1], xi_norm, err[-1], terr=None if terr is None else terr[-1])
         else:
             v_H = None
         J = policy_objective(ro, v_H, cfg.gamma)
@@ -113,12 +122,14 @@ class PolicyTrainer:
                 feat_d, goals_d, err_d = feat.detach(), goals.detach(), err.detach()
                 H1, n, _ = feat_d.shape
                 xi_rep = xi_norm[None].expand(H1, n, -1)
-                values = self.critic(feat_d.reshape(H1 * n, -1), goals_d.reshape(H1 * n, -1), xi_rep.reshape(H1 * n, -1), err_d.reshape(H1 * n, -1)).reshape(H1, n)
+                terr_d = None if terr is None else terr.detach().reshape(H1 * n, -1)
+                values = self.critic(feat_d.reshape(H1 * n, -1), goals_d.reshape(H1 * n, -1), xi_rep.reshape(H1 * n, -1), err_d.reshape(H1 * n, -1), terr=terr_d).reshape(H1, n)
                 targets = gae_targets(ro.rewards.detach(), ro.dhat[1:].detach(), values, cfg.gamma, cfg.gae_lambda)  # (H, n)
                 X_feat = feat_d[:-1].reshape(-1, feat_d.shape[-1])
                 X_goal = goals_d[:-1].reshape(-1, goals_d.shape[-1])
                 X_xi = xi_rep[:-1].reshape(-1, xi_rep.shape[-1])
                 X_err = err_d[:-1].reshape(-1, err_d.shape[-1])
+                X_terr = None if terr_d is None else terr_d[: (H1 - 1) * n]
                 Y = targets.reshape(-1)
             N = Y.shape[0]
             mb = N // cfg.critic_minibatches
@@ -127,7 +138,7 @@ class PolicyTrainer:
                 perm = torch.randperm(N, device=Y.device)
                 for i in range(cfg.critic_minibatches):
                     idx = perm[i * mb : (i + 1) * mb]
-                    pred = self.critic(X_feat[idx], X_goal[idx], X_xi[idx], X_err[idx])
+                    pred = self.critic(X_feat[idx], X_goal[idx], X_xi[idx], X_err[idx], terr=None if X_terr is None else X_terr[idx])
                     closs = torch.nn.functional.mse_loss(pred, Y[idx])
                     self.critic_opt.zero_grad(set_to_none=True)
                     closs.backward()

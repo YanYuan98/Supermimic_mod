@@ -6,6 +6,9 @@ context ``xi_t``, reward ``r_{t+1}``, the target frame/clip of that step and boo
 flags. When an episode ends an extra *terminal* row is written that holds ``s_{T+1}``
 (no transition out of it) and the termination label of that state, so k-step windows
 can use it as their last target state and the termination head gets positive labels.
+Every row also stores its episode origin ``o_ep`` (states are relative to it; terrain
+lookups need world = o_ep + local). Windows and starts never cross an episode, so each
+carries a single origin.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ class WindowBatch:
     reward: torch.Tensor  # (k, n)
     done: torch.Tensor  # (k, n) termination label of states 1..k
     frame: torch.Tensor  # (k, n) target frame of each transition
+    origin: torch.Tensor | None = None  # (n, 3) episode origin of the window
 
 
 @dataclass
@@ -34,6 +38,7 @@ class StartBatch:
     prev_action: torch.Tensor  # (n, A) clean action of the previous step (0 at episode start)
     hist_states: torch.Tensor  # (hist, n, S) states s_{t-hist+1..t} (backfilled at episode start)
     hist_actions: torch.Tensor  # (hist, n, A) clean actions a_{t-hist..t-1} aligned with hist_states' obs
+    origin: torch.Tensor | None = None  # (n, 3) episode origin
 
 
 class ReplayBuffer:
@@ -46,6 +51,7 @@ class ReplayBuffer:
         self.a = f(act_dim)
         self.a_exec = f(act_dim)
         self.xi = f(xi_dim)
+        self.origin = f(3)
         self.r = f()
         self.done = f()
         self.frame = torch.zeros(E, T, dtype=torch.long, device=self.device)
@@ -62,12 +68,13 @@ class ReplayBuffer:
     # ------------------------------------------------------------------ writes
 
     @torch.no_grad()
-    def add(self, env_ids, s, a, a_exec, xi, r, done, frame, clip, terminal, ep_start) -> None:
+    def add(self, env_ids, s, a, a_exec, xi, r, done, frame, clip, terminal, ep_start, origin=None) -> None:
         p = self.ptr[env_ids]
         self.s[env_ids, p] = s
         self.a[env_ids, p] = a
         self.a_exec[env_ids, p] = a_exec
         self.xi[env_ids, p] = xi
+        self.origin[env_ids, p] = 0.0 if origin is None else origin
         self.r[env_ids, p] = r
         self.done[env_ids, p] = done
         self.frame[env_ids, p] = frame
@@ -134,6 +141,7 @@ class ReplayBuffer:
             reward=self.r[ee[:-1], tt[:-1]],
             done=self.done[ee[1:], tt[1:]],
             frame=self.frame[ee[:-1], tt[:-1]],
+            origin=self.origin[e, t],
         )
 
     @torch.no_grad()
@@ -167,4 +175,5 @@ class ReplayBuffer:
             prev_action=hist_actions[-1],
             hist_states=hist_states,
             hist_actions=hist_actions,
+            origin=self.origin[e, t],
         )

@@ -177,3 +177,76 @@ def test_anchor_relative_obs_matches_env(mode, goal_features):
             np.testing.assert_allclose(lib_goal.cpu().numpy(), obs["goal"][:, :nf].cpu().numpy(), atol=1e-6)
     finally:
         env.close()
+
+
+def test_terrain_reward_and_termination_match_mjlab():
+    """Terrain parity (VISION_TERRAIN_PLAN M0): on ``mixed`` the simulator's reward terms and terminations
+    (world frame, the command's lifted reference) equal the analytic heads evaluated on the origin-relative
+    state with ``lifted_reference(lib, frame, o_ep, map)`` - what the world model / imagination use."""
+    from mjlab.envs import mdp as base_mdp
+    from mjlab.managers.scene_entity_config import SceneEntityCfg
+    from mjlab.tasks.tracking import mdp
+
+    from supermimic.data.motion_convert import load_g1_model
+    from supermimic.envs import SuperMimicEnvCfgArgs, make_env
+    from supermimic.envs.mdp import terminations as sm_term
+    from supermimic.envs.mdp.motion_library import discover_npz
+    from supermimic.envs.state_io import StateIO
+    from supermimic.envs.tracking_env_cfg import ANCHOR_BODY, ROOT_BODY, TRACKED_BODIES
+    from supermimic.kinematics.g1_fk import G1Kinematics
+    from supermimic.terrain import lifted_reference
+    from supermimic.world_model.heads import AnalyticHeads
+
+    files = discover_npz(NPZ, names=["walk1_subject1", "fight1_subject2"])
+    args = SuperMimicEnvCfgArgs(npz_files=[str(f) for f in files], num_envs=36, replay_capacity=64, obs_noise=False, seed=5,
+                                terrain="mixed", terrain_seed=3, terrain_rows=4, terrain_level=3, njmax=600, nconmax=70, ccd_iterations=100)  # fmt: skip
+    env = make_env(args, device="cuda:0")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        robot = env.scene["robot"]
+        heads = AnalyticHeads(G1Kinematics(load_g1_model(), device=env.device), TRACKED_BODIES, ANCHOR_BODY, ROOT_BODY,
+                              robot.data.soft_joint_pos_limits[0].clone(), robot.data.default_joint_pos[0].clone())  # fmt: skip
+        io = StateIO(env)
+        cmd = env.command_manager.get_term("motion")
+        lib = cmd.library
+        ids = torch.arange(env.num_envs, device=env.device)
+        cmd.forced_tile[:, 0] = 1 + ids % 3  # every column, rows 1..3: non-trivial lifts
+        cmd.forced_tile[:, 1] = ids % cmd.layout.num_cols
+        env.reset()
+        cmd.forced_tile[:] = -1
+        asset_cfg = SceneEntityCfg("robot", joint_names=(".*",))
+        asset_cfg.resolve(env.scene)
+        worst, max_lift = {}, 0.0
+        for step in range(25):
+            env.step(0.5 * torch.randn(env.num_envs, 29, device=env.device))
+            s = io.read()  # relative to the live o_ep
+            ref = lifted_reference(lib, cmd.frame, io.origins, cmd.tmap)
+            # The command's world-frame reference is the lifted local reference translated by o_ep.
+            torch.testing.assert_close(cmd.body_pos_w, ref.body_pos_w + io.origins[:, None], atol=1e-5, rtol=0)
+            torch.testing.assert_close(cmd.root_pos_w, ref.root_pos_w + io.origins, atol=1e-5, rtol=0)
+            max_lift = max(max_lift, (ref.root_pos_w[:, 2] - lib.ref(cmd.frame).root_pos_w[:, 2]).abs().max().item())
+            ours = heads.reward(s, env.action_manager.action, env.action_manager.prev_action, ref)
+            theirs = {
+                "motion_global_root_pos": 0.5 * mdp.motion_global_anchor_position_error_exp(env, "motion", 0.3),
+                "motion_global_root_ori": 0.5 * mdp.motion_global_anchor_orientation_error_exp(env, "motion", 0.4),
+                "motion_body_pos": mdp.motion_relative_body_position_error_exp(env, "motion", 0.3),
+                "motion_body_ori": mdp.motion_relative_body_orientation_error_exp(env, "motion", 0.4),
+                "motion_body_lin_vel": mdp.motion_global_body_linear_velocity_error_exp(env, "motion", 1.0),
+                "motion_body_ang_vel": mdp.motion_global_body_angular_velocity_error_exp(env, "motion", 3.14),
+                "action_rate_l2": -0.1 * base_mdp.action_rate_l2(env),
+                "joint_limit": -2.0 * base_mdp.joint_pos_limits(env, asset_cfg),
+            }
+            for k, v in theirs.items():
+                worst[k] = max(worst.get(k, 0.0), (ours[k] / 0.02 - v).abs().max().item())
+            # Terminations: continuous features vs the command's (lifted) quantities, then the booleans.
+            f = heads.termination_features(s[:, 0:3], s[:, 3:7], ref)
+            h_env = cmd.root_pos_w[:, 2] - cmd.robot_root_pos_w[:, 2]
+            np.testing.assert_allclose(f[:, 0].cpu().numpy(), h_env.cpu().numpy(), atol=2e-5)
+            theirs_h, theirs_t = sm_term.bad_root_height(env, "motion", 0.25), sm_term.bad_root_tilt(env, "motion", 0.8)
+            assert torch.equal(heads.terminated(s, ref), theirs_h | theirs_t) or min((f[:, 0].abs() - 0.25).abs().min(), (f[:, 1].abs() - 0.8).abs().min()) < 1e-4
+        print(f"\nterrain parity: max lift {max_lift:.3f} m, worst term diffs {worst}")
+        assert max_lift > 0.1  # the comparison really exercised lifted references
+        for k, d in worst.items():
+            assert d < 2e-5, (k, d, worst)
+    finally:
+        env.close()

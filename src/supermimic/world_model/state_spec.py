@@ -75,14 +75,16 @@ class StateSpec:
     def split(s: torch.Tensor):
         return s[..., 0:3], s[..., 3:7], s[..., 7:36], s[..., 36:39], s[..., 39:42], s[..., 42:71]
 
-    def canonical(self, s: torch.Tensor) -> torch.Tensor:
-        """Heading-invariant, scaled network input features (…, 71)."""
+    def canonical(self, s: torch.Tensor, *, ground_z: torch.Tensor | None = None) -> torch.Tensor:
+        """Heading-invariant, scaled network input features (…, 71). With ``ground_z`` (…) (terrain: the
+        blurred ground under the pelvis) the root height is taken above it instead of above z = 0."""
         p, q, qj, v, w, qd = self.split(s)
         q = quat_normalize(q)
         hq = heading_quat(q)
         q_local = quat_canonical(quat_mul(quat_apply_inverse_quat(hq), q))
         v_h = quat_apply_inverse(hq, v)
-        feat = torch.cat([p[..., 2:3], rot6d_from_quat(q_local), v_h, w, qj, qd], dim=-1)
+        z = p[..., 2:3] if ground_z is None else p[..., 2:3] - ground_z[..., None]
+        feat = torch.cat([z, rot6d_from_quat(q_local), v_h, w, qj, qd], dim=-1)
         return feat / self.in_scale
 
     def normalize_xi(self, xi: torch.Tensor) -> torch.Tensor:

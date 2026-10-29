@@ -165,3 +165,45 @@ def test_world_model_options(cpu_lib):
     low[:, 2] -= 0.4
     p_bad = torch.sigmoid(wm.termination_logits(low, ref))
     assert p_ok.max() < 1e-3 and p_bad.min() > 0.99
+
+
+def test_policy_critic_terrain_inputs_and_warm_start():
+    """VISION_TERRAIN_PLAN §2.5: terrain_dim = 0 builds main's networks; with terrain the decoder input is
+    [z_motion, z_terrain, obs] and the scan is keyword-only; a flat state dict warm-starts the terrain networks
+    with zero input columns, so the outputs equal the flat ones (the scan changes nothing yet)."""
+    import dataclasses
+
+    from supermimic.policy.nets import Critic, CriticCfg, Policy, PolicyCfg
+    from supermimic.training.warm_start import CRITIC_IN, DECODER_IN, load_expanded
+
+    torch.manual_seed(0)
+    pcfg = PolicyCfg(encoder_hidden=(64, 32), decoder_hidden=(64, 32), goal_dim=686)
+    flat = Policy(pcfg)
+    assert flat.terrain is None and not any(k.startswith("terrain") for k in flat.state_dict())
+    tp = Policy(dataclasses.replace(pcfg, terrain_dim=187))
+    assert tp.decoder.mlp.net[0].in_features == 32 + 32 + 930
+    obs, goal, scan = torch.randn(16, 930), torch.randn(16, 686), torch.rand(16, 187) * 2 - 1
+    with pytest.raises(ValueError):
+        tp(obs, goal)
+    with pytest.raises(TypeError):
+        tp(obs, goal, "motion", scan)  # scan is keyword-only
+    for p in flat.decoder.norm.buffers():
+        p.data.uniform_(0.5, 1.5)  # non-trivial normalisers are copied too
+    ccfg = CriticCfg(hidden=(32, 16))
+    flat_c, tc = Critic(ccfg, goal_dim=686), Critic(dataclasses.replace(ccfg, terrain_dim=215), goal_dim=686)
+    fresh_p = load_expanded(tp, flat.state_dict(), DECODER_IN, pcfg.latent_dim, ("terrain.",))
+    fresh_c = load_expanded(tc, flat_c.state_dict(), CRITIC_IN, flat_c.mlp.net[0].in_features, ())
+    assert set(fresh_p) == {k for k in tp.state_dict() if k.startswith("terrain.")} and fresh_c == []
+    tp.update_input_norms(obs, goal, scan=scan)
+    flat.update_input_norms(obs, goal)  # same obs / goal normaliser updates on both
+    assert tp.terrain.norm.count == 16
+    torch.testing.assert_close(tp(obs, goal, scan=scan), flat(obs, goal), atol=1e-6, rtol=0)
+    torch.testing.assert_close(tp(obs, goal, scan=-scan), flat(obs, goal), atol=1e-6, rtol=0)
+    f, x, e, t = torch.randn(16, 71), torch.randn(16, 33), torch.randn(16, 84), torch.randn(16, 215)
+    torch.testing.assert_close(tc(f, goal, x, e, terr=t), flat_c(f, goal, x, e), atol=1e-6, rtol=0)
+    # The new columns are trainable: a gradient reaches them.
+    tp(obs, goal, scan=scan).sum().backward()
+    assert tp.decoder.mlp.net[0].weight.grad[:, 32:64].abs().sum() > 0
+    # Mismatched architectures are rejected.
+    with pytest.raises(ValueError):
+        load_expanded(Policy(dataclasses.replace(pcfg, decoder_hidden=(48, 32), terrain_dim=187)), flat.state_dict(), DECODER_IN, pcfg.latent_dim, ("terrain.",))

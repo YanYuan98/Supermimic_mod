@@ -10,6 +10,10 @@ Both panels use the same G1 model, camera, ghost and metrics (computed here from
   * root drift: horizontal distance between robot and reference pelvis;
   * failure: the paper's training termination (pelvis height error > 0.25 m or tilt error > 0.8).
 
+Terrain rollouts (``record_rollouts.py --terrain mixed``) carry ``s{i}_origin`` and ``metadata_json["terrain"]``;
+when both sides were recorded on the same terrain map it is rebuilt and drawn, and the poses are shifted to world
+coordinates (origin + local).
+
 Needs MuJoCo EGL, PIL, imageio-ffmpeg and mjlab (G1 asset); e.g. with rgmt_mjlab's environment:
   MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=3 python scripts/render_compare.py --spec logs/compare_rgmt/video_spec.json
 """
@@ -35,18 +39,27 @@ TRACKED = ("pelvis", "left_hip_roll_link", "left_knee_link", "left_ankle_roll_li
 MAP = 200
 
 
-def build_model():
+def build_model(terrain: dict | None = None):
+    """G1 + floor, or G1 + the recorded terrain grid (``metadata_json["terrain"]`` of record_rollouts.py)."""
     from mjlab.asset_zoo.robots import get_g1_robot_cfg
     from mjlab.entity import Entity
 
     spec = Entity(get_g1_robot_cfg()).spec
+    if terrain is not None:
+        from mjlab.terrains.terrain_generator import TerrainGenerator
+
+        from supermimic.terrain import make_terrain_generator_cfg
+
+        gen = make_terrain_generator_cfg(terrain["terrain"], seed=terrain["terrain_seed"], size=terrain["terrain_size"], num_rows=terrain["terrain_rows"], border=terrain["terrain_border"], stairs_platform=terrain.get("stairs_platform"))
+        TerrainGenerator(gen).compile(spec)
     spec.add_texture(name="grid", type=mujoco.mjtTexture.mjTEXTURE_2D, builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER, rgb1=[0.82, 0.84, 0.86],
                      rgb2=[0.70, 0.72, 0.75], width=512, height=512, mark=mujoco.mjtMark.mjMARK_EDGE, markrgb=[0.55, 0.57, 0.6])  # fmt: skip
     spec.add_texture(name="sky", type=mujoco.mjtTexture.mjTEXTURE_SKYBOX, builtin=mujoco.mjtBuiltin.mjBUILTIN_GRADIENT,
                      rgb1=[0.93, 0.95, 0.98], rgb2=[0.75, 0.80, 0.88], width=512, height=3072)  # fmt: skip
     mat = spec.add_material(name="grid", texrepeat=[4, 4], texuniform=True, reflectance=0.0)
     mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = "grid"
-    spec.worldbody.add_geom(name="floor", type=mujoco.mjtGeom.mjGEOM_PLANE, size=[0, 0, 0.1], material="grid", contype=0, conaffinity=0)
+    if terrain is None:
+        spec.worldbody.add_geom(name="floor", type=mujoco.mjtGeom.mjGEOM_PLANE, size=[0, 0, 0.1], material="grid", contype=0, conaffinity=0)
     spec.worldbody.add_light(pos=[0, 0, 6], dir=[0, 0, -1], diffuse=[0.6, 0.6, 0.6], castshadow=False)
     spec.visual.global_.offwidth, spec.visual.global_.offheight = PW, PH
     spec.visual.quality.shadowsize = 4096
@@ -85,10 +98,13 @@ def set_qpos(model, data, pos, quat, joints):
 class Track:
     """One policy's rollout of one clip plus the per-sample metrics."""
 
-    def __init__(self, roll, i):
+    def __init__(self, roll, i, world: bool = False):
         k = f"s{i}_"
         self.rp, self.rq, self.jp = roll[k + "root_pos"], roll[k + "root_quat"], roll[k + "joint_pos"]
         self.gp, self.gq, self.gj = roll[k + "ref_root_pos"], roll[k + "ref_root_quat"], roll[k + "ref_joint_pos"]
+        self.world = world and k + "origin" in roll
+        if self.world:  # terrain rollouts: draw at the recorded tile
+            self.rp, self.gp = self.rp + roll[k + "origin"], self.gp + roll[k + "origin"]
         self.n = len(self.rp)
         self.drift = np.linalg.norm(self.rp[:, :2] - self.gp[:, :2], axis=-1)
         dz = np.abs(self.gp[:, 2] - self.rp[:, 2])
@@ -96,6 +112,10 @@ class Track:
         bad = np.flatnonzero((dz > 0.25) | (tilt > 0.8))
         self.first_fail = int(bad[0]) if bad.size else None
         self.err_mm = np.full(self.n, np.nan)
+
+    def lookat(self, s):
+        """Camera target: robot pelvis xy at 0.8 m (terrain: the lifted reference pelvis height)."""
+        return np.array([self.rp[s, 0], self.rp[s, 1], self.gp[s, 2] if self.world else 0.8])
 
 
 def keypoint_errors(model, track, body_ids, lo, hi):
@@ -162,7 +182,11 @@ def main():
     F = lambda name, size: ImageFont.truetype(str(font_dir / name), size)  # noqa: E731
     fonts = {"title": F("NotoSansCJKsc-Bold.otf", 34), "body": F("NotoSansCJKsc-Regular.otf", 21), "seg": F("NotoSansCJKsc-Bold.otf", 30),
              "small": F("NotoSansCJKsc-Regular.otf", 17), "stat": F("NotoSansCJKsc-Regular.otf", 22), "fail": F("NotoSansCJKsc-Bold.otf", 44)}  # fmt: skip
-    model = build_model()
+    terrains = [m.get("terrain") for m in metas]
+    terrain = terrains[0] if terrains[0] is not None and all(t is not None and {k: v for k, v in t.items() if k not in ("col", "row")} == {k: v for k, v in terrains[0].items() if k not in ("col", "row")} for t in terrains) else None
+    if terrain is None and any(t is not None for t in terrains):
+        print("[WARN] the sides were recorded on different terrain maps; drawing a flat floor at the local origin")
+    model = build_model(terrain)
     body_ids = np.array([mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, b) for b in TRACKED])
     assert (body_ids >= 0).all()
     robot, ghost = mujoco.MjData(model), mujoco.MjData(model)
@@ -181,7 +205,7 @@ def main():
     ) as writer:  # fmt: skip
         for si, seg in enumerate(spec["segments"]):
             idx = [next(j for j, m in enumerate(meta["segments"]) if m["clip"] == seg["clip"]) for meta in metas]
-            tracks = [Track(r, j) for r, j in zip(rolls, idx)]
+            tracks = [Track(r, j, world=terrain is not None) for r, j in zip(rolls, idx)]
             lo = int(round(seg["start_s"] / DT))
             hi = min(lo + int(round(seg["duration_s"] / DT)), *(t.n for t in tracks))
             for t in tracks:
@@ -190,7 +214,7 @@ def main():
             if a.test_frames:
                 count = min(count, a.test_frames)
             cam.azimuth = float(seg.get("azimuth", 135.0))
-            lookats = [np.array([t.rp[lo, 0], t.rp[lo, 1], 0.8]) for t in tracks]
+            lookats = [t.lookat(lo) for t in tracks]
             seg_writer = imageio.get_writer(str(seg_out / f"{si + 1}_{seg['clip']}.mp4"), fps=FPS, codec="libx264", quality=8,
                                             pixelformat="yuv420p", macro_block_size=8)  # fmt: skip
             for f in range(count):
@@ -198,7 +222,7 @@ def main():
                 canvas = Image.new("RGB", (W, H), (246, 247, 249))
                 draw = ImageDraw.Draw(canvas, "RGBA")
                 for k, (t, side) in enumerate(zip(tracks, sides)):
-                    target = np.array([t.rp[s, 0], t.rp[s, 1], 0.8])
+                    target = t.lookat(s)
                     lookats[k] = target if f == 0 else lookats[k] + 0.15 * (target - lookats[k])
                     img = render_panel(renderer, model, robot, ghost, cam, opt, t, s, lookats[k])
                     x0 = k * PW
