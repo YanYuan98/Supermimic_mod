@@ -18,6 +18,8 @@ contact-normal fix (``terrain.mjwarp_patch``). ``none`` (default) builds exactly
 
 from __future__ import annotations
 
+import dataclasses
+
 import os
 from dataclasses import dataclass, field
 
@@ -44,6 +46,7 @@ from supermimic.envs.mdp import observations as sm_obs
 from supermimic.envs.mdp import terminations as sm_term
 from supermimic.envs.mdp.commands import MultiClipMotionCommandCfg
 from supermimic.goal_spec import anchor_mode
+from supermimic.terrain.depth import DepthCfg
 from supermimic.terrain.heightmap import ScanNoiseCfg, TerrainMapCfg
 
 class QuietSimulationCfg(SimulationCfg):
@@ -113,6 +116,7 @@ class SuperMimicEnvCfgArgs:
     spawn_margin: float = 0.5
     scan_noise: ScanNoiseCfg = field(default_factory=ScanNoiseCfg)  # applied only with obs_noise (or scan_noise_always)
     scan_noise_always: bool = False  # apply scan_noise even with obs_noise off (benchmark robustness, plan M5-A)
+    depth: DepthCfg | None = None  # rendered policy depth frames (terrain plane | mixed); noise follows obs_noise
     # MuJoCo Warp capacity overrides (None = main's njmax 250 / nconmax 35 / ccd_iterations 50).
     njmax: int | None = None
     nconmax: int | None = None
@@ -168,6 +172,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             terrain_level=a.terrain_level,
             terrain_map=TerrainMapCfg(res=a.terrain_res, cache_dir=a.terrain_cache_dir),
             scan_noise=a.scan_noise if (a.obs_noise or a.scan_noise_always) else ScanNoiseCfg(enabled=False),
+            depth=None if a.depth is None else (a.depth if (a.obs_noise or a.scan_noise_always) else dataclasses.replace(a.depth, noise=False)),
             spawn_margin=a.spawn_margin,
         )
 

@@ -3,7 +3,7 @@
 Every tensor of the flat state dict is copied unchanged, except the first Linear layer of the policy
 decoder, the critic and the world-model dynamics, whose weight gains zero-initialised input columns for the
 new terrain inputs: the initial outputs equal the flat model's, and the new columns still receive gradients.
-Modules that do not exist in the flat model (``TerrainEncoder``, the world model's ``terr_norm``) keep their
+Modules that do not exist in the flat model (``TerrainEncoder``, ``DepthModules``, the world model's ``terr_norm``) keep their
 fresh initialisation. Anything else that does not match is an error (e.g. a different network size).
 """
 
@@ -17,7 +17,7 @@ import torch.nn as nn
 DECODER_IN = "decoder.mlp.net.0.weight"
 CRITIC_IN = "mlp.net.0.weight"
 WM_IN = "dynamics.mlp.net.0.weight"
-NEW_PREFIXES = {"policy": ("terrain.",), "critic": (), "wm": ("terr_norm.",)}
+NEW_PREFIXES = {"policy": ("terrain.", "depth."), "critic": (), "wm": ("terr_norm.",)}
 
 
 def expand_input_columns(old: torch.Tensor, new_in: int, insert_at: int) -> torch.Tensor:

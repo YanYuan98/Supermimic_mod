@@ -4,6 +4,9 @@ Terrain (docs/VISION_TERRAIN_PLAN.md §2.5): with ``PolicyCfg.terrain_dim > 0`` 
 (noisy) height scan to a 32-d latent and the decoder input becomes [z_motion, z_terrain, obs_hist];
 ``CriticCfg.terrain_dim > 0`` appends the noise-free terrain features to the critic input. Both default to
 0, which builds exactly the flat networks (old checkpoints load strictly).
+
+Depth (``PolicyCfg.terrain_input = "depth"``): z_terrain comes from rendered depth frames instead
+(``DepthModules``: per-frame CNN, an MLP over the frame history and an auxiliary scan head used only in training).
 """
 
 from __future__ import annotations
@@ -13,7 +16,8 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 
-from supermimic.world_model.dynamics import MLP, RunningNorm
+from supermimic.world_model.dynamics import ACTIVATIONS, MLP, RunningNorm
+from supermimic.world_model import dynamics as _dyn
 from supermimic.world_model.heads import CRITIC_ERR_DIM, OBS_TERMS
 
 GOAL_DIM = 680
@@ -43,6 +47,15 @@ class PolicyCfg:
     terrain_dim: int = 0
     terrain_hidden: tuple[int, ...] = (256, 128)
     terrain_latent_dim: int = 32
+    # "scan" (terrain_dim > 0: TerrainEncoder on the height scan) | "depth" (DepthModules on rendered depth frames).
+    terrain_input: str = "scan"
+    depth_hw: tuple[int, int] = (20, 32)  # image rows, columns (set from DepthCfg by the trainer)
+    depth_slots: int = 16  # frames read from the history (set from DepthCfg)
+    depth_channels: tuple[int, ...] = (16, 32, 64)
+    depth_feat_dim: int = 32  # per-frame feature e
+    depth_agg_hidden: int = 256
+    depth_aux_hidden: int = 256
+    depth_aux_dim: int = 187  # noise-free scan predicted by the auxiliary head
 
 
 @dataclass
@@ -91,8 +104,12 @@ class MotionEncoder(nn.Module):
         return torch.tanh(self.mlp(self.norm(goal) if self.norm is not None else goal * self.scale))
 
 
+def _uses_depth(cfg: PolicyCfg) -> bool:
+    return getattr(cfg, "terrain_input", "scan") == "depth"
+
+
 def _terrain_latent(cfg: PolicyCfg) -> int:
-    return cfg.terrain_latent_dim if getattr(cfg, "terrain_dim", 0) else 0
+    return cfg.terrain_latent_dim if (getattr(cfg, "terrain_dim", 0) or _uses_depth(cfg)) else 0
 
 
 class TerrainEncoder(nn.Module):
@@ -105,6 +122,54 @@ class TerrainEncoder(nn.Module):
 
     def forward(self, scan: torch.Tensor) -> torch.Tensor:
         return torch.tanh(self.mlp(self.norm(scan)))
+
+
+class DepthEncoder(nn.Module):
+    """Per-frame CNN: (…, 2, H, W) [normalised depth, validity] -> e (…, depth_feat_dim). ELU, no normalisation layers."""
+
+    def __init__(self, cfg: PolicyCfg):
+        super().__init__()
+        act = ACTIVATIONS[getattr(cfg, "activation", "elu")]
+        layers, c_in = [], 2
+        for i, c in enumerate(cfg.depth_channels):
+            k = 5 if i == 0 else 3
+            layers += [nn.Conv2d(c_in, c, k, stride=2, padding=k // 2), act()]
+            c_in = c
+        self.conv = nn.Sequential(*layers, nn.Flatten())
+        with torch.no_grad():
+            flat = self.conv(torch.zeros(1, 2, *cfg.depth_hw)).shape[-1]
+        self.fc = nn.Sequential(nn.Linear(flat, 128), act(), nn.Linear(128, cfg.depth_feat_dim))
+
+    def forward(self, img: torch.Tensor) -> torch.Tensor:
+        lead = img.shape[:-3]
+        x = img.reshape(-1, *img.shape[-3:])
+        if _dyn.AMP_DTYPE is not None and x.is_cuda:
+            with torch.autocast("cuda", dtype=_dyn.AMP_DTYPE):
+                e = self.fc(self.conv(x)).float()
+        else:
+            e = self.fc(self.conv(x))
+        return e.reshape(*lead, -1)
+
+
+class DepthModules(nn.Module):
+    """encoder: frame -> e; aggregator: [e, g_cam] x slots -> h -> z_terrain; aux: h -> noise-free scan (training only)."""
+
+    def __init__(self, cfg: PolicyCfg):
+        super().__init__()
+        from supermimic.terrain.depth import DEPTH_FEAT_EXTRA
+
+        act = getattr(cfg, "activation", "elu")
+        self.slot_dim = cfg.depth_feat_dim + DEPTH_FEAT_EXTRA
+        self.encoder = DepthEncoder(cfg)
+        self.agg_in = MLP(cfg.depth_slots * self.slot_dim, (), cfg.depth_agg_hidden)  # one Linear; activation below
+        self.agg_act = ACTIVATIONS[act]()
+        self.agg_out = nn.Linear(cfg.depth_agg_hidden, cfg.terrain_latent_dim)
+        self.aux = MLP(cfg.depth_agg_hidden, (cfg.depth_aux_hidden,), cfg.depth_aux_dim, act=act)
+
+    def latent(self, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """slots (B, S, slot_dim) oldest -> newest -> (z_terrain (B, latent), h (B, agg_hidden))."""
+        h = self.agg_act(self.agg_in(slots.reshape(slots.shape[0], -1)))
+        return torch.tanh(self.agg_out(h)), h
 
 
 class Decoder(nn.Module):
@@ -127,17 +192,36 @@ class Policy(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.encoders = nn.ModuleDict({"motion": MotionEncoder(cfg)})
-        self.terrain = TerrainEncoder(cfg) if getattr(cfg, "terrain_dim", 0) else None
+        self.terrain = TerrainEncoder(cfg) if (getattr(cfg, "terrain_dim", 0) and not _uses_depth(cfg)) else None
+        self.depth = DepthModules(cfg) if _uses_depth(cfg) else None
         self.decoder = Decoder(cfg)
 
-    def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor, interface: str = "motion", *, scan: torch.Tensor | None = None) -> torch.Tensor:
-        """``scan`` (N, 187): policy height scan; required iff the policy has a terrain encoder (ignored otherwise)."""
+    def forward(
+        self,
+        obs_hist: torch.Tensor,
+        goal: torch.Tensor,
+        interface: str = "motion",
+        *,
+        scan: torch.Tensor | None = None,
+        depth_slots: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``scan`` (N, 187): policy height scan, required iff the policy has a terrain encoder. ``depth_slots``
+        (N, S, slot_dim): [e, g_cam] of the history frames (``encode_slots``), required iff it has depth modules."""
         z = self.encoders[interface](goal)
+        if self.depth is not None:
+            if depth_slots is None:
+                raise ValueError("this policy takes depth: pass depth_slots=")
+            return self.decoder(z, obs_hist, self.depth.latent(depth_slots)[0])
         if self.terrain is None:
             return self.decoder(z, obs_hist)
         if scan is None:
             raise ValueError("this policy has a terrain encoder: pass scan=")
         return self.decoder(z, obs_hist, self.terrain(scan))
+
+    def encode_slots(self, imgs: torch.Tensor, g_cam: torch.Tensor) -> torch.Tensor:
+        """imgs (S, N, 2, H, W), g_cam (S, N, 3) of the slot frames (oldest first) -> depth_slots (N, S, slot_dim)."""
+        e = self.depth.encoder(imgs.float())
+        return torch.cat([e, g_cam.to(e.dtype)], dim=-1).transpose(0, 1)
 
     @torch.no_grad()
     def update_input_norms(self, obs_hist: torch.Tensor, goal: torch.Tensor, interface: str = "motion", *, scan: torch.Tensor | None = None) -> None:

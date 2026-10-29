@@ -26,6 +26,8 @@ class ImagRollout:
     reward_terms: dict  # mean of each reward term over the rollout (diagnostics, tensors)
     crit_terr: torch.Tensor | None = None  # (H+1, n, 215) noise-free critic terrain features (terrain only)
     ground_z: torch.Tensor | None = None  # (H+1, n) blurred ground under the pelvis (terrain only)
+    aux_h: torch.Tensor | None = None  # (H, n, agg_hidden) depth aggregator hidden of s_0..s_{H-1} (depth only)
+    aux_vis: torch.Tensor | None = None  # (H, n, 187) scan cells seen by the slot cameras (depth only)
 
 
 def imagine(
@@ -36,12 +38,15 @@ def imagine(
     heads_fn: ImagHeads,
     future_frames: int = 10,
     goal_features: str = "v1",
+    obs_history: int | None = None,
 ) -> ImagRollout:
     """Roll the policy through the world model for ``horizon`` steps from replay-buffer starts.
 
     Observation noise and the goal's anchor term follow ``step_fn``'s settings. With ``step_fn.terrain``
     the references are lifted, the policy sees the noisy delayed scan (history seeded from the logged
-    ``hist_states``, noise parameters drawn per start) and the critic features include the terrain.
+    ``hist_states``, noise parameters drawn per start) and the critic features include the terrain. With
+    ``step_fn.depth`` the policy sees rendered depth frames instead (``_init_depth_history``).
+    ``obs_history``: proprioceptive history length (the last rows of ``hist_states``; default all rows).
     """
     device = start.state.device
     n = start.state.shape[0]
@@ -65,11 +70,28 @@ def imagine(
 
     # Initial observation history from the logged states / actions (noise re-sampled per frame).
     q0 = lib.default_joint_pos
-    hist = torch.stack([step_fn.noisy(analytic_observation(start.hist_states[i], start.hist_actions[i], start.xi, q0)) for i in range(start.hist_states.shape[0])])
+    n_hist = start.hist_states.shape[0]
+    k0 = 0 if obs_history is None else n_hist - obs_history
+    hist = torch.stack([step_fn.noisy(analytic_observation(start.hist_states[i], start.hist_actions[i], start.xi, q0)) for i in range(k0, n_hist)])
 
     s = start.state
     states, actions, goals = [s], [], []
-    if terrain is None:
+    aux_h = aux_vis = None
+    if step_fn.depth is not None:
+        dparams, q_hist, e_hist, cam_hist = _init_depth_history(step_fn, start, terrain.grid)
+        hs, vs = [], []
+        for t in range(H):
+            step = torch.full((), t, dtype=torch.long, device=device)
+            s, a, hist, q_hist, e_hist, cam_hist, g, h, vis = step_fn.step_depth(
+                s, hist, q_hist, e_hist, cam_hist, step, goal_ref[t], anchor_pos[t], anchor_quat[t], start.xi, start.origin, dparams, terrain.grid
+            )
+            states.append(s)
+            actions.append(a)
+            goals.append(g)
+            hs.append(h)
+            vs.append(vis)
+        aux_h, aux_vis = torch.stack(hs), torch.stack(vs)
+    elif terrain is None:
         for t in range(H):
             s, a, hist, g = step_fn(s, hist, goal_ref[t], anchor_pos[t], anchor_quat[t], start.xi)
             states.append(s)
@@ -112,4 +134,48 @@ def imagine(
         reward_terms={k: v for k, v in zip(REWARD_TERM_NAMES, term_vec.detach().mean(dim=(1, 2)).unbind(0))},
         crit_terr=crit_terr,
         ground_z=ground_z,
+        aux_h=aux_h,
+        aux_vis=aux_vis,
     )
+
+
+@torch.no_grad()
+def _init_depth_history(step_fn: ImagStep, start: StartBatch, grid, chunk: int = 32768, dparams=None):
+    """Per-start camera parameters and the histories before step 0, rebuilt from the logged states: qpos (L, n, 36),
+    frame features [e, g_cam] (F, n, slot_dim) and true camera poses (F, n, 12) of the sample steps t < 0
+    ((t + phase) % sample_every == 0), each frame rendered from the state ``lag`` (+ jitter) steps earlier. Episode
+    starts are backfilled in ``hist_states`` (the simulator fills its history with the reset frame likewise).
+    The frame features carry no gradient (the encoder is trained on the frames of the rollout)."""
+    from dataclasses import replace
+
+    from supermimic.terrain.depth import sample_depth_params
+
+    ds, pol = step_fn.depth, step_fn.policy
+    cfg = ds.cfg
+    noise = step_fn.depth_noise
+    hs = start.hist_states
+    Hh, n = hs.shape[0], hs.shape[1]
+    assert Hh >= cfg.start_hist, f"depth needs {cfg.start_hist} logged states per start, got {Hh}"
+    dev = hs.device
+    if dparams is None:
+        dparams = sample_depth_params(n, cfg if noise else replace(cfg, noise=False), dev)
+    k, F, L = cfg.sample_every, cfg.hist_frames, cfg.state_hist
+    t_last = -1 - ((dparams.phase - 1) % k)  # newest sample step before 0
+    t_f = t_last[None, :] - k * torch.arange(F - 1, -1, -1, device=dev)[:, None]  # (F, n) oldest first
+    lag = torch.stack([ds.frame_draws(dparams, noise)[0] for _ in range(F)])  # (F, n)
+    row = (Hh - 1 + t_f - lag).clamp_min(0)
+    qcap = hs[row, torch.arange(n, device=dev)[None, :].expand(F, n)][..., :36]
+    rep = lambda x: x[None].expand(F, *x.shape).reshape(F * n, *x.shape[1:])  # noqa: E731
+    prm = type(dparams)(*(rep(x) for x in dparams))
+    org = rep(start.origin)
+    qf = qcap.reshape(F * n, 36)
+    feats, cams = [], []
+    for i in range(0, F * n, chunk):
+        sl = slice(i, i + chunk)
+        obs = ds.observe(qf[sl], org[sl], type(prm)(*(x[sl] for x in prm)), grid, noise)
+        feats.append(torch.cat([pol.depth.encoder(obs.img), obs.g_cam], dim=-1))
+        cams.append(torch.cat([obs.cam_pos, obs.cam_R.flatten(-2)], dim=-1))
+    e_hist = torch.cat(feats).view(F, n, -1)
+    cam_hist = torch.cat(cams).view(F, n, -1)
+    q_hist = hs[Hh - 1 - L : Hh - 1, :, :36].clone()
+    return dparams, q_hist, e_hist, cam_hist

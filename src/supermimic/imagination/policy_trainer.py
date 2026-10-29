@@ -16,6 +16,7 @@ from supermimic.training.distributed import allreduce_grads
 from supermimic.world_model.world_model import WorldModel
 
 if TYPE_CHECKING:
+    from supermimic.terrain.depth import DepthSensor
     from supermimic.terrain.inputs import TerrainInputs
 
 
@@ -46,18 +47,31 @@ class PolicyTrainerCfg:
     # supermimic_vibed option: only start imagined rollouts at states whose target frame is at least
     # ``start_margin`` frames before the clip end (0 = any state; past the end the last frame is held).
     start_margin: int = 32
+    # Depth policy: weight of the auxiliary scan regression (visible cells only) added to the actor loss.
+    aux_weight: float = 0.1
 
 
 class PolicyTrainer:
-    def __init__(self, wm: WorldModel, policy: Policy, critic: Critic, lib: MotionLibrary, cfg: PolicyTrainerCfg, *, terrain: TerrainInputs | None = None):
+    def __init__(
+        self,
+        wm: WorldModel,
+        policy: Policy,
+        critic: Critic,
+        lib: MotionLibrary,
+        cfg: PolicyTrainerCfg,
+        *,
+        terrain: TerrainInputs | None = None,
+        depth: DepthSensor | None = None,
+    ):
         self.wm, self.policy, self.critic, self.lib, self.cfg = wm, policy, critic, lib, cfg
         self.terrain = terrain
+        self.depth = depth
         fused = torch.cuda.is_available()
         self.opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr, betas=cfg.betas, fused=fused)
         self.critic_opt = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr, fused=fused)
         from supermimic.imagination.compiled import ImagHeads, ImagStep
 
-        self.step_fn = ImagStep(wm, policy, lib.default_joint_pos, anchor_obs=cfg.anchor_obs, obs_noise=cfg.obs_noise, compile_mode=cfg.compile, terrain=terrain)
+        self.step_fn = ImagStep(wm, policy, lib.default_joint_pos, anchor_obs=cfg.anchor_obs, obs_noise=cfg.obs_noise, compile_mode=cfg.compile, terrain=terrain, depth=depth)
         self.heads_fn = ImagHeads(wm, critic_features=critic.err_dim > 4, compile_mode=cfg.compile, terrain=terrain)
 
     def set_lr(self, lr: float, critic_lr: float | None = None) -> None:
@@ -80,13 +94,14 @@ class PolicyTrainer:
         extra = None
         if cfg.start_margin > 0:
             extra = buffer.frame + cfg.start_margin <= self.lib.last_frame_of(buffer.frame)
-        start = buffer.sample_starts(cfg.batch_size, cfg.history, extra_mask=extra)
+        n_hist = cfg.history if self.depth is None else max(cfg.history, self.depth.cfg.start_hist)
+        start = buffer.sample_starts(cfg.batch_size, n_hist, extra_mask=extra)
         xi_norm = self.wm.spec.normalize_xi(start.xi)
 
         # ---- actor: BPTT through the frozen world model ------------------------------------
         self.wm.requires_grad_(False)
         self.critic.requires_grad_(False)
-        ro = imagine(self.lib, start, cfg.horizon, self.step_fn, self.heads_fn, cfg.future_frames, cfg.goal_features)
+        ro = imagine(self.lib, start, cfg.horizon, self.step_fn, self.heads_fn, cfg.future_frames, cfg.goal_features, obs_history=cfg.history)
         feat, goals, err, terr = self._critic_inputs(ro)
         if cfg.use_critic:
             v_H = self.critic(feat[-1], goals[-1], xi_norm, err[-1], terr=None if terr is None else terr[-1])
@@ -94,9 +109,21 @@ class PolicyTrainer:
             v_H = None
         J = policy_objective(ro, v_H, cfg.gamma)
         loss = -J if cfg.objective_scale == "sum" else -J / cfg.horizon
+        aux = None
+        if ro.aux_h is not None:
+            # Auxiliary scan regression of the depth modules: noise-free scan of s_t at the cells the slot cameras saw.
+            pred = self.policy.depth.aux(ro.aux_h)
+            target = ro.crit_terr[:-1, :, -pred.shape[-1] :].detach()
+            m = ro.aux_vis.to(pred.dtype)
+            aux = (m * (pred - target).square()).sum() / m.sum().clamp_min(1.0)
+            loss = loss + cfg.aux_weight * aux
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         allreduce_grads(self.policy)
+        depth_gn = None
+        if self.policy.depth is not None:
+            grads = [p.grad for p in self.policy.depth.encoder.parameters() if p.grad is not None]
+            depth_gn = torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(g) for g in grads])) if grads else torch.zeros((), device=loss.device)
         gn = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.grad_clip_norm)
         torch.nn.utils.clip_grad_value_(self.policy.parameters(), cfg.grad_clip_value)
         self.opt.step()
@@ -115,6 +142,18 @@ class PolicyTrainer:
         }
         for k, v in ro.reward_terms.items():
             metrics[f"imag_r/{k}"] = v
+        if aux is not None:
+            with torch.no_grad():
+                h = ro.aux_h.reshape(-1, ro.aux_h.shape[-1])
+                z = torch.tanh(self.policy.depth.agg_out(h.float()))
+                zstd = z.std(0)
+                metrics["depth/aux_loss"] = aux.detach()
+                metrics["depth/aux_visible_frac"] = ro.aux_vis.float().mean()
+                metrics["depth/z_std_mean"] = zstd.mean()
+                metrics["depth/z_dead_frac"] = (zstd < 1e-3).float().mean()  # constant latent dims
+                metrics["depth/z_sat_frac"] = (z.abs() > 0.99).float().mean()
+                metrics["depth/h_inactive_frac"] = (h.std(0) < 1e-4).float().mean()
+                metrics["depth/encoder_grad_norm"] = depth_gn
 
         # ---- critic: fit to GAE targets of this rollout (targets fixed) ---------------------
         if cfg.use_critic:

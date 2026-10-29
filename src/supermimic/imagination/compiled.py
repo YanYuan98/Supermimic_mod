@@ -15,6 +15,11 @@ episode's shifted points, pushes it into the scan history and corrupts it (laten
 dropout: the sim's noise model, only on the policy's copy), while the world model gets the noise-free
 condition of the current predicted state. ``ImagHeads`` additionally returns the critic's noise-free
 terrain features and the ground height for all (H+1)·n states. Without ``terrain`` both run main's graphs.
+
+Depth (``depth`` given, a ``DepthSensor``): instead of the scan, every step renders the frame of the state ``lag``
+steps old (same sensor model as the simulator), encodes it and pushes [e, g_cam] into the frame history on the
+envs' sample steps; the policy reads the history slots. The step also returns the aggregator's hidden h_t (input of
+the auxiliary scan head) and which of the current scan cells the slot cameras saw (its loss mask).
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from supermimic.world_model.heads import ReferenceFrame, analytic_observation, a
 from supermimic.world_model.world_model import WorldModel
 
 if TYPE_CHECKING:
+    from supermimic.terrain.depth import DepthParams, DepthSensor
     from supermimic.terrain.inputs import TerrainInputs
 
 REWARD_TERM_NAMES = (
@@ -57,7 +63,18 @@ def _compile(fn, mode: str | None):
 class ImagStep:
     """(s_t, noisy obs history, reference goal part of g_t, reference anchor) -> (s_{t+1}, a_t, history', g_t)."""
 
-    def __init__(self, wm: WorldModel, policy, default_joint_pos: torch.Tensor, anchor_obs: str | bool = "none", obs_noise: bool = True, compile_mode: str | None = None, *, terrain: TerrainInputs | None = None):
+    def __init__(
+        self,
+        wm: WorldModel,
+        policy,
+        default_joint_pos: torch.Tensor,
+        anchor_obs: str | bool = "none",
+        obs_noise: bool = True,
+        compile_mode: str | None = None,
+        *,
+        terrain: TerrainInputs | None = None,
+        depth: DepthSensor | None = None,
+    ):
         self.wm, self.policy, self.q0 = wm, policy, default_joint_pos
         self.mode = anchor_mode(anchor_obs)
         self.obs_noise = obs_noise
@@ -72,7 +89,12 @@ class ImagStep:
 
             # Policy-side scan corruption follows the observation-noise switch (like the sim's obs_noise).
             self.scan_noise = terrain.scan_noise if obs_noise else replace(terrain.scan_noise, enabled=False)
-        self._fn = _compile(self._step if terrain is None else self._step_terrain, compile_mode)
+        self.depth = depth
+        if depth is not None:
+            assert terrain is not None, "depth needs the terrain inputs (world model / critic)"
+            self.depth_noise = obs_noise and depth.cfg.noise
+        step = self._step if terrain is None else (self._step_depth if depth is not None else self._step_terrain)
+        self._fn = _compile(step, compile_mode)
         self._goal_fn = _compile(self.goal, compile_mode)
 
     def noisy(self, o: torch.Tensor) -> torch.Tensor:
@@ -111,6 +133,44 @@ class ImagStep:
     def step_terrain(self, s, hist, scan_hist, goal_ref, ref_anchor_pos, ref_anchor_quat, xi, origin, noise, grid):
         """-> (s_{t+1}, a_t, history', scan history', g_t); ``noise``: per-start ``ScanNoiseParams``."""
         return self._fn(s, hist, scan_hist, goal_ref, ref_anchor_pos, ref_anchor_quat, xi, origin, noise, grid)
+
+
+    def _step_depth(self, s, hist, q_hist, e_hist, cam_hist, step, goal_ref, ref_anchor_pos, ref_anchor_quat, xi, origin, dparams, grid):
+        from supermimic.terrain.depth import push_rows
+
+        ds, pol = self.depth, self.policy
+        L = q_hist.shape[0]
+        q_hist = torch.cat([q_hist[1:], s[None, :, :36]], dim=0)  # newest = s_t
+        lag, drop = ds.frame_draws(dparams, self.depth_noise)
+        qcap = torch.gather(q_hist, 0, (L - 1 - lag).view(1, -1, 1).expand(1, q_hist.shape[1], 36))[0]
+        obs = ds.observe(qcap, origin, dparams, grid, self.depth_noise)
+        feat = torch.cat([pol.depth.encoder(obs.img), obs.g_cam], dim=-1)
+        cam = torch.cat([obs.cam_pos, obs.cam_R.flatten(-2)], dim=-1)
+        sample = ds.is_sample_step(step, dparams)
+        feat = torch.where(drop[:, None], e_hist[-1], feat)
+        cam = torch.where(drop[:, None], cam_hist[-1], cam)
+        e_hist = push_rows(e_hist, feat, sample)
+        cam_hist = push_rows(cam_hist, cam, sample)
+        idx = ds.slot_idx
+        z_terr, h = pol.depth.latent(e_hist[idx].transpose(0, 1))
+        # Auxiliary-loss mask: scan cells of the current state inside a slot camera's frustum.
+        with torch.no_grad():
+            tm = self.terrain.tmap
+            root_w = s[:, 0:3].detach() + origin
+            xy = tm.scan_points(root_w, s[:, 3:7].detach())
+            pts = torch.cat([xy, tm.height(xy, grid)[..., None]], dim=-1)
+            cs = cam_hist[idx]
+            vis = ds.visible(pts, cs[..., 0:3], cs[..., 3:12].unflatten(-1, (3, 3)))
+        g = self.goal(s, goal_ref, ref_anchor_pos, ref_anchor_quat)
+        a = pol.decoder(pol.encoders["motion"](g), flatten_history_term_major(hist), z_terr)
+        s_next = self.wm.step_at(s, a, xi, origin, grid)
+        o = self.noisy(analytic_observation(s_next, a, xi, self.q0))
+        return s_next, a, torch.cat([hist[1:], o[None]], dim=0), q_hist, e_hist, cam_hist, g, h, vis
+
+    def step_depth(self, s, hist, q_hist, e_hist, cam_hist, step, goal_ref, ref_anchor_pos, ref_anchor_quat, xi, origin, dparams: DepthParams, grid):
+        """-> (s_{t+1}, a_t, history', qpos history', frame history', camera history', g_t, h_t, aux mask);
+        ``step`` a 0-d long tensor (no recompilation per step)."""
+        return self._fn(s, hist, q_hist, e_hist, cam_hist, step, goal_ref, ref_anchor_pos, ref_anchor_quat, xi, origin, dparams, grid)
 
 
 class ImagHeads:

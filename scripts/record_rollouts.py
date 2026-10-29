@@ -51,7 +51,7 @@ def main(
 
     policy, cfg = load_policy_from_checkpoint(ckpt, device)
     if terrain is None:
-        terrain = "plane" if policy.terrain is not None else "none"
+        terrain = "plane" if (policy.terrain is not None or policy.depth is not None) else "none"
     tkw = terrain_env_kwargs_for_eval(cfg, terrain, terrain_seed)
     files = discover_npz(npz_dir, names=clips)
     if sorted(f.stem for f in files) != sorted(clips):
@@ -97,7 +97,7 @@ def main(
             origin = io.origins.clone()  # episode origins (the env resets again after a short clip ends)
             for k in range(T):
                 if k > 0:
-                    obs, *_ = env.step(act(policy, obs))
+                    obs, *_ = env.step(act(policy, obs, env.command_manager.get_term("motion")))
                 s = io.read() if terrain != "mixed" else _read_local(env, origin)
                 fr = lib.clip_start + torch.clamp(torch.tensor(k, device=device), max=lib.clip_len - 1)
                 ref = lib.ref(fr)

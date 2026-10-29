@@ -58,7 +58,7 @@ def main(
     files = [str(f) for f in discover_npz(npz_dir, names=clips, manifest=manifest)]
     policy, cfg = load_policy_from_checkpoint(ckpt, device)
     if terrain is None:
-        terrain = "plane" if policy.terrain is not None else "none"
+        terrain = "plane" if (policy.terrain is not None or policy.depth is not None) else "none"
     if scan_noise_scale > 0 and terrain == "none":
         raise ValueError("--scan-noise-scale needs a terrain-capable evaluation (--terrain plane | mixed)")
     tkw = terrain_env_kwargs_for_eval(cfg, terrain, terrain_seed, scan_noise_scale=scan_noise_scale)

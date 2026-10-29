@@ -92,8 +92,13 @@ def terrain_env_kwargs_for_eval(cfg: dict, terrain: str, seed: int | None = EVAL
     return {**terrain_env_kwargs(t), "scan_noise_always": True}
 
 
-def act(policy: Policy, obs) -> torch.Tensor:
-    """Deterministic action from an env observation dict (the scan only for terrain-capable policies)."""
+def act(policy: Policy, obs, command=None) -> torch.Tensor:
+    """Deterministic action from an env observation dict (the scan only for terrain-capable policies; depth
+    policies read their frames from the motion ``command``)."""
+    if policy.depth is not None:
+        if command is None or getattr(command, "depth_sensor", None) is None:
+            raise ValueError("depth policy: evaluate in an env with the depth camera and pass command=")
+        return policy(obs["policy"], obs["goal"], depth_slots=policy.encode_slots(*command.depth_slots()))
     if policy.terrain is None:
         return policy(obs["policy"], obs["goal"])
     return policy(obs["policy"], obs["goal"], scan=obs["terrain"])
@@ -119,7 +124,7 @@ def run_benchmark(
     "mixed" = one job per (clip, column, row) with ``terrain_cols`` (default all) x ``terrain_rows``."""
     terrain_kwargs = terrain_kwargs or {}
     mixed = terrain_kwargs.get("terrain") == "mixed"
-    if policy.terrain is not None and not terrain_kwargs:
+    if (policy.terrain is not None or policy.depth is not None) and not terrain_kwargs:
         raise ValueError("terrain-capable policy: evaluate with terrain 'plane' or 'mixed'")
     n_files = len(npz_files)
     if mixed:
@@ -185,7 +190,7 @@ def run_benchmark(
             tile_half = torch.tensor(cmd.layout.tile_size, device=device) * 0.5
             left_tile = torch.full((num_envs,), -1, dtype=torch.long, device=device)
         while remaining > 0:
-            obs, rew, term, tout, _ = env.step(act(policy, obs))
+            obs, rew, term, tout, _ = env.step(act(policy, obs, cmd))
             ret_sum += rew
             term_sum += env.reward_manager.term_rewards
             steps += 1

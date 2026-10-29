@@ -35,7 +35,7 @@ MAIN_LAYOUT_DIGESTS = {
     '{"obs_noise": false, "reset_noise": false, "domain_randomization": false, "record_transitions": false, "sampling_mode": "start", "episode_length_s": 100000.0}': "ae99ab66016ee19d62ec5315dbf8ca88ce9590b4",
 }
 # Command-config fields added for terrain (inert defaults with terrain="none"); excluded from the digest.
-NEW_COMMAND_FIELDS = {"terrain", "terrain_level", "terrain_map", "scan_noise", "spawn_margin", "spawn_horizon", "max_step_reward", "terrain_stats_min_steps"}
+NEW_COMMAND_FIELDS = {"terrain", "terrain_level", "terrain_map", "scan_noise", "depth", "spawn_margin", "spawn_horizon", "max_step_reward", "terrain_stats_min_steps"}
 
 
 def _norm(x):

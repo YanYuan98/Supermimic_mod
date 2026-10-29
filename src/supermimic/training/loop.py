@@ -41,7 +41,13 @@ class Trainer:
 
         tcfg = cfg.terrain
         terrain_on = tcfg.kind != "none"
-        cfg.policy.terrain_dim = SCAN_DIM if terrain_on else 0
+        use_depth = terrain_on and tcfg.policy_obs == "depth"
+        cfg.policy.terrain_dim = SCAN_DIM if (terrain_on and not use_depth) else 0
+        cfg.policy.terrain_input = "depth" if use_depth else "scan"
+        if use_depth:
+            cfg.policy.depth_hw = (tcfg.depth.out_h, tcfg.depth.width)
+            cfg.policy.depth_slots = tcfg.depth.slots
+            cfg.policy.depth_aux_dim = SCAN_DIM
         cfg.critic.terrain_dim = CRITIC_TERRAIN_DIM if terrain_on else 0
         cfg.world_model.terrain = tcfg.wm_terrain if terrain_on else "none"
         from supermimic.world_model import dynamics
@@ -101,11 +107,16 @@ class Trainer:
         fk = G1Kinematics(load_g1_model(), device=self.device)
         heads = AnalyticHeads(fk, TRACKED_BODIES, ANCHOR_BODY, ROOT_BODY, robot.data.soft_joint_pos_limits[0].clone(), robot.data.default_joint_pos[0].clone())
         self.terrain = None
+        self.depth = None
         if terrain_on:
             from supermimic.terrain import TerrainInputs
 
             # The map is owned by the motion command (a plain object, never a module buffer: see TerrainMap).
             self.terrain = TerrainInputs(self.command.tmap, fk, tcfg.wm_terrain, tcfg.scan_noise, tcfg.grad)
+            if use_depth:
+                from supermimic.terrain.depth import DepthSensor
+
+                self.depth = DepthSensor(tcfg.depth, fk, self.command.tmap)
         self.wm = WorldModel(cfg.world_model, heads, self.device, terrain=self.terrain)
         self.policy = Policy(cfg.policy).to(self.device)
         self.critic = Critic(cfg.critic, pcfg=cfg.policy).to(self.device)
@@ -114,7 +125,7 @@ class Trainer:
         for m in (self.wm, self.policy, self.critic):
             broadcast_params(m)
         self.wm_trainer = WorldModelTrainer(self.wm, self.lib, cfg.wm_trainer, terrain=self.terrain)
-        self.policy_trainer = PolicyTrainer(self.wm, self.policy, self.critic, self.lib, cfg.policy_trainer, terrain=self.terrain)
+        self.policy_trainer = PolicyTrainer(self.wm, self.policy, self.critic, self.lib, cfg.policy_trainer, terrain=self.terrain, depth=self.depth)
         n_params = lambda m: sum(p.numel() for p in m.parameters())  # noqa: E731
         if self.is_main:
             print(f"[INFO] params: world model {n_params(self.wm)/1e6:.2f}M, policy {n_params(self.policy)/1e6:.2f}M, critic {n_params(self.critic)/1e6:.3f}M")
@@ -198,6 +209,10 @@ class Trainer:
             if not self.cfg.schedule.wm_only:
                 self.policy.update_input_norms(obs["policy"], obs["goal"])  # no-op unless policy.input_norm == "running"
             return self.policy(obs["policy"], obs["goal"])
+        if self.policy.depth is not None:
+            if not self.cfg.schedule.wm_only:
+                self.policy.update_input_norms(obs["policy"], obs["goal"])
+            return self.policy(obs["policy"], obs["goal"], depth_slots=self.policy.encode_slots(*self.command.depth_slots()))
         scan = obs["terrain"]
         if not self.cfg.schedule.wm_only:
             self.policy.update_input_norms(obs["policy"], obs["goal"], scan=scan)

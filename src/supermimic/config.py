@@ -8,6 +8,7 @@ from typing import Literal
 
 from supermimic.imagination.policy_trainer import PolicyTrainerCfg
 from supermimic.policy.nets import CriticCfg, PolicyCfg
+from supermimic.terrain.depth import DepthCfg
 from supermimic.terrain.heightmap import ScanNoiseCfg
 from supermimic.world_model.wm_trainer import WMTrainerCfg
 from supermimic.world_model.world_model import WorldModelCfg
@@ -94,6 +95,10 @@ class TerrainCfg:
     # 5 x 3 sole clearances + 5 x 5 patch at 5 cm per foot, plan §7 mitigation).
     wm_terrain: Literal["none", "foot", "scan", "both", "foot_fine"] = "foot"
     scan_noise: ScanNoiseCfg = field(default_factory=ScanNoiseCfg)  # policy scan only (sim + imagination)
+    # Policy terrain input: "scan" (noisy 17x11 height scan) | "depth" (rendered D435 frames, terrain/depth.py).
+    # The world model and the critic keep their noise-free terrain features either way.
+    policy_obs: Literal["scan", "depth"] = "scan"
+    depth: DepthCfg = field(default_factory=DepthCfg)
     grad: bool = False  # True: let gradients flow through the terrain slope (bilinear weights); default detached
     curriculum: TerrainCurriculumCfg = field(default_factory=TerrainCurriculumCfg)
     size: float = 12.0  # tile edge, m
@@ -150,6 +155,8 @@ def terrain_env_kwargs(tcfg) -> dict:
         spawn_margin=t["spawn_margin"],
         scan_noise=ScanNoiseCfg(**t["scan_noise"]),
     )
+    if t.get("policy_obs", "scan") == "depth":
+        out["depth"] = DepthCfg(**t["depth"])
     if t["kind"] == "mixed":
         out.update(njmax=t["njmax"], nconmax=t["nconmax"], ccd_iterations=t["ccd_iterations"])
     return out

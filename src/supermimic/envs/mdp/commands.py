@@ -18,6 +18,11 @@ the tile, writes the episode origin o_ep = (p_spawn.xy - lib_root_xy(start), 0) 
 recorder read it live), lifts the spawn so no sole point penetrates the terrain, and lifts the
 reference by the blurred ground under its root (``body_pos_w`` / ``root_pos_w`` / ``anchor_pos_w``, the
 same ``reference_lift`` the world model and the imagination use). ``none`` is main's code path.
+
+Depth (``cfg.depth`` set): the command also renders the policy's depth frames (``terrain.depth.DepthSensor``, the
+same function the imagination uses) from the simulator qpos: a qpos history for the latency, the frame history
+(fp16 images + g_cam; one frame every ``sample_every`` steps with a per-episode phase, filled with the first frame
+at reset) and the per-episode camera parameters. ``depth_slots()`` returns the frames the policy reads.
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ from mjlab.utils.lab_api.math import (
 )
 
 from supermimic.envs.mdp.motion_library import MotionLibrary
+from supermimic.terrain.depth import DepthCfg
 from supermimic.terrain.heightmap import ScanNoiseCfg, TerrainMapCfg
 
 if TYPE_CHECKING:
@@ -145,6 +151,9 @@ class MultiClipMotionCommand(CommandTerm):
         self.scan_hist = torch.zeros(cfg.scan_noise.history_len, n, SCAN_DIM, device=self.device)
         self.scan_noise = sample_scan_noise(n, cfg.scan_noise, self.device)
         self._scan_reset = torch.ones(n, dtype=torch.bool, device=self.device)
+        self.depth_sensor = None
+        if cfg.depth is not None:
+            self._init_depth(cfg.depth)
         if cfg.terrain == "plane":
             return
         self.layout = self.tmap.layout
@@ -162,6 +171,70 @@ class MultiClipMotionCommand(CommandTerm):
         self.spawn_misfit = torch.zeros((), dtype=torch.long, device=self.device)  # paths that did not fit their tile
         self._dz = torch.zeros(n, 3, device=self.device)
         env.scene.env_origins[:, 2] = 0.0  # o_ep.z = 0 (mjlab initialises the origins at the tile spawn z)
+
+    def _init_depth(self, dcfg: DepthCfg) -> None:
+        from supermimic.terrain.depth import DepthSensor, sample_depth_params
+
+        n, dev = self.num_envs, self.device
+        self.depth_sensor = DepthSensor(dcfg, self.fk, self.tmap)
+        self.depth_params = sample_depth_params(n, dcfg, dev)
+        self.depth_q = torch.zeros(dcfg.state_hist, n, 36, device=dev)  # world qpos, oldest -> newest
+        self.depth_img = torch.zeros(dcfg.hist_frames, n, 2, dcfg.out_h, dcfg.width, device=dev, dtype=torch.float16)
+        self.depth_g = torch.zeros(dcfg.hist_frames, n, 3, device=dev)
+        self.depth_step = torch.zeros(n, dtype=torch.long, device=dev)
+        self._depth_reset = torch.ones(n, dtype=torch.bool, device=dev)
+        self._depth_zero_origin = torch.zeros(n, 3, device=dev)
+        # Full-batch per-step path compiled (FK of the capsule bodies dominates eagerly); reset subsets run eagerly.
+        self._depth_observe = torch.compile(self.depth_sensor.observe, dynamic=False)
+
+    def depth_slots(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """(images (S, N, 2, H, W) fp16, g_cam (S, N, 3)) of the frames the policy reads, oldest first."""
+        idx = self.depth_sensor.slot_idx
+        return self.depth_img[idx], self.depth_g[idx]
+
+    def _update_depth(self, env_ids: torch.Tensor | None) -> None:
+        """Advance the depth camera of ``env_ids`` by one control step (qpos is fresh, see ``_update_scan``)."""
+        from supermimic.terrain.depth import DepthParams, push_rows
+
+        ds = self.depth_sensor
+        dcfg = ds.cfg
+        full = env_ids is None
+        ids = slice(None) if full else env_ids
+        qw = self._env.sim.data.qpos[ids][:, :36]
+        reset = self._depth_reset[ids]
+        prm = DepthParams(*(x[ids] for x in self.depth_params))
+        L = dcfg.state_hist
+        qh = self.depth_q[:, ids]
+        qh = torch.where(reset[None, :, None], qw[None].expand_as(qh), torch.cat([qh[1:], qw[None]], dim=0))
+        lag, drop = ds.frame_draws(prm)
+        drop = drop & ~reset
+        sample = ds.is_sample_step(self.depth_step[ids], prm) | reset
+        qcap = torch.gather(qh, 0, (L - 1 - lag).view(1, -1, 1).expand(1, qh.shape[1], 36))[0]
+        zero = self._depth_zero_origin[ids]
+        obs = (self._depth_observe if full else ds.observe)(qcap, zero, prm)
+        img_h, g_h = self.depth_img[:, ids], self.depth_g[:, ids]
+        img = torch.where(drop.view(-1, 1, 1, 1), img_h[-1], obs.img.to(img_h.dtype))
+        g = torch.where(drop.view(-1, 1), g_h[-1], obs.g_cam)
+        img_new = torch.where(reset.view(1, -1, 1, 1, 1), img[None].expand_as(img_h), push_rows(img_h, img, sample))
+        g_new = torch.where(reset.view(1, -1, 1), g[None].expand_as(g_h), push_rows(g_h, g, sample))
+        if full:
+            self.depth_q.copy_(qh)
+            self.depth_img.copy_(img_new)
+            self.depth_g.copy_(g_new)
+            self.depth_step += 1
+        else:
+            self.depth_q[:, ids] = qh
+            self.depth_img[:, ids] = img_new
+            self.depth_g[:, ids] = g_new
+            self.depth_step[ids] += 1
+        self._depth_reset[ids] = False
+
+    def _reset_depth(self, env_ids: torch.Tensor) -> None:
+        from supermimic.terrain.depth import resample_depth_params_
+
+        resample_depth_params_(self.depth_params, env_ids, self.depth_sensor.cfg)
+        self.depth_step[env_ids] = 0
+        self._depth_reset[env_ids] = True
 
     @property
     def policy_scan(self) -> torch.Tensor:
@@ -494,6 +567,8 @@ class MultiClipMotionCommand(CommandTerm):
         self._write_reference_state_to_sim(env_ids, root_pos, root_ori, root_lin_vel, root_ang_vel, joint_pos, joint_vel)
         if self.tmap is not None:
             self._reset_scan(env_ids)
+            if self.depth_sensor is not None:
+                self._reset_depth(env_ids)
 
     def update_relative_body_poses(self) -> None:
         nb = len(self.cfg.body_names)
@@ -527,6 +602,8 @@ class MultiClipMotionCommand(CommandTerm):
         self.update_relative_body_poses()
         if self.tmap is not None:
             self._update_scan(env_ids)
+            if self.depth_sensor is not None:
+                self._update_depth(env_ids)
 
     def reset_to_frame(self, env_ids: torch.Tensor, frame: torch.Tensor) -> None:
         """Deterministic reset to exact reference frames (no noise); used by evaluation. On ``mixed`` the
@@ -548,6 +625,8 @@ class MultiClipMotionCommand(CommandTerm):
         self._write_reference_state_to_sim(env_ids, root_pos, r.root_quat_w, r.root_lin_vel_w, r.root_ang_vel_w, joint_pos, r.joint_vel)
         if self.tmap is not None:
             self._reset_scan(env_ids)
+            if self.depth_sensor is not None:
+                self._reset_depth(env_ids)
 
     # ------------------------------------------------------------------ debug visualization (viewer only)
 
@@ -617,6 +696,7 @@ class MultiClipMotionCommandCfg(CommandTermCfg):
     terrain_level: int = 2  # initial curriculum level L (spawn rows ~ U{0..L})
     terrain_map: TerrainMapCfg = field(default_factory=TerrainMapCfg)
     scan_noise: ScanNoiseCfg = field(default_factory=ScanNoiseCfg)  # policy scan corruption (disabled for evaluation)
+    depth: DepthCfg | None = None  # rendered policy depth frames (terrain/depth.py); None = no camera
     spawn_margin: float = 0.5  # m between the reference path bbox and the tile edge
     spawn_horizon: int = 32  # the spawn bbox covers one episode + this many frames (imagination horizon)
     max_step_reward: float = 0.1  # normalisation of the terrain-episode returns (curriculum)

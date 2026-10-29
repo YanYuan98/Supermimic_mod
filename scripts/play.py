@@ -31,12 +31,12 @@ from supermimic.eval.benchmark import EVAL_TERRAIN_SEED, act, load_policy_from_c
 class _DictPolicy:
     """Adapts policy(obs_policy, obs_goal[, scan]) to the viewer's policy(obs) protocol."""
 
-    def __init__(self, policy):
-        self.policy = policy
+    def __init__(self, policy, command=None):
+        self.policy, self.command = policy, command
 
     @torch.no_grad()
     def __call__(self, obs):
-        return act(self.policy, obs)
+        return act(self.policy, obs, self.command)
 
 
 def main(
@@ -56,7 +56,7 @@ def main(
     files = [str(f) for f in discover_npz(npz_dir, names=clips)]
     policy, cfg = load_policy_from_checkpoint(ckpt, device)
     if terrain is None:
-        terrain = "plane" if policy.terrain is not None else "none"
+        terrain = "plane" if (policy.terrain is not None or policy.depth is not None) else "none"
     args = SuperMimicEnvCfgArgs(
         npz_files=files,
         num_envs=num_envs,
@@ -79,7 +79,7 @@ def main(
         cmd.forced_tile[:, 0] = terrain_row if terrain_row is not None else -1
         cmd.forced_tile[:, 1] = cmd.layout.col_index(terrain_col) if terrain_col is not None else -1
     env = RslRlVecEnvWrapper(raw)
-    pol = _DictPolicy(policy)
+    pol = _DictPolicy(policy, cmd)
     if viewer == "auto":
         viewer = "native" if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) else "viser"
     print(f"[INFO] {len(files)} clip(s), {num_envs} env(s), viewer={viewer}")

@@ -64,7 +64,7 @@ def main(ckpt: Path, speeds: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0), num_envs:
     policy, cfg = load_policy_from_checkpoint(ckpt, device)
     tmp = Path(tempfile.mkdtemp()) / "tpose.npz"
     make_tpose_clip(tmp)
-    terrain = "plane" if policy.terrain is not None else "none"  # flat-ground protocol; terrain policies need the scan
+    terrain = "plane" if (policy.terrain is not None or policy.depth is not None) else "none"  # flat-ground protocol; terrain policies need the scan
     args = SuperMimicEnvCfgArgs(npz_files=[str(tmp)], num_envs=num_envs, action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False, sampling_mode="start", record_transitions=False, episode_length_s=1e5, future_frames=cfg["env"]["future_frames"], anchor_obs=anchor_mode(cfg["env"].get("anchor_obs", False)), goal_features=cfg["env"].get("goal_features", "v1"), self_collision=cfg["env"].get("self_collision", True), seed=0, **terrain_env_kwargs_for_eval(cfg, terrain))
     env = make_env(args, device=device)
     robot = env.scene["robot"]
@@ -84,7 +84,7 @@ def main(ckpt: Path, speeds: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0), num_envs:
                 v[:, 1] += speed * torch.sin(ang)
                 robot.write_root_link_velocity_to_sim(v)
                 pushed = True
-            obs, rew, term, tout, _ = env.step(act(policy, obs))
+            obs, rew, term, tout, _ = env.step(act(policy, obs, env.command_manager.get_term("motion")))
             fallen |= term
             if pushed:
                 err = torch.norm(cmd.root_pos_w - cmd.robot_root_pos_w, dim=-1)
