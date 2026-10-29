@@ -78,12 +78,17 @@ def imagine(
     states, actions, goals = [s], [], []
     aux_h = aux_vis = None
     if step_fn.depth is not None:
-        dparams, q_hist, e_hist, cam_hist = _init_depth_history(step_fn, start, terrain.grid)
+        # One frame-sample phase for the whole batch (drawn per update): sample steps are known on the host, so
+        # the other steps skip rendering / encoding (the simulator keeps a per-episode phase).
+        k = step_fn.depth.cfg.sample_every
+        phase = int(torch.randint(0, k, ()).item())
+        dparams, q_hist, e_hist, cam_hist = _init_depth_history(step_fn, start, terrain.grid, phase=phase)
+        if torch.is_grad_enabled():
+            e_hist.requires_grad_(True)  # same autograd signature on every step: fewer compiled variants of the step
         hs, vs = [], []
         for t in range(H):
-            step = torch.full((), t, dtype=torch.long, device=device)
             s, a, hist, q_hist, e_hist, cam_hist, g, h, vis = step_fn.step_depth(
-                s, hist, q_hist, e_hist, cam_hist, step, goal_ref[t], anchor_pos[t], anchor_quat[t], start.xi, start.origin, dparams, terrain.grid
+                s, hist, q_hist, e_hist, cam_hist, (t + phase) % k == 0, goal_ref[t], anchor_pos[t], anchor_quat[t], start.xi, start.origin, dparams, terrain.grid
             )
             states.append(s)
             actions.append(a)
@@ -140,7 +145,7 @@ def imagine(
 
 
 @torch.no_grad()
-def _init_depth_history(step_fn: ImagStep, start: StartBatch, grid, chunk: int = 32768, dparams=None):
+def _init_depth_history(step_fn: ImagStep, start: StartBatch, grid, dparams=None, phase: int | None = None):
     """Per-start camera parameters and the histories before step 0, rebuilt from the logged states: qpos (L, n, 36),
     frame features [e, g_cam] (F, n, slot_dim) and true camera poses (F, n, 12) of the sample steps t < 0
     ((t + phase) % sample_every == 0), each frame rendered from the state ``lag`` (+ jitter) steps earlier. Episode
@@ -159,23 +164,30 @@ def _init_depth_history(step_fn: ImagStep, start: StartBatch, grid, chunk: int =
     dev = hs.device
     if dparams is None:
         dparams = sample_depth_params(n, cfg if noise else replace(cfg, noise=False), dev)
+    if phase is not None:
+        dparams = dparams._replace(phase=torch.full_like(dparams.phase, phase))
     k, F, L = cfg.sample_every, cfg.hist_frames, cfg.state_hist
     t_last = -1 - ((dparams.phase - 1) % k)  # newest sample step before 0
     t_f = t_last[None, :] - k * torch.arange(F - 1, -1, -1, device=dev)[:, None]  # (F, n) oldest first
     lag = torch.stack([ds.frame_draws(dparams, noise)[0] for _ in range(F)])  # (F, n)
     row = (Hh - 1 + t_f - lag).clamp_min(0)
     qcap = hs[row, torch.arange(n, device=dev)[None, :].expand(F, n)][..., :36]
-    rep = lambda x: x[None].expand(F, *x.shape).reshape(F * n, *x.shape[1:])  # noqa: E731
-    prm = type(dparams)(*(rep(x) for x in dparams))
-    org = rep(start.origin)
-    qf = qcap.reshape(F * n, 36)
-    feats, cams = [], []
-    for i in range(0, F * n, chunk):
-        sl = slice(i, i + chunk)
-        obs = ds.observe(qf[sl], org[sl], type(prm)(*(x[sl] for x in prm)), grid, noise)
-        feats.append(torch.cat([pol.depth.encoder(obs.img), obs.g_cam], dim=-1))
-        cams.append(torch.cat([obs.cam_pos, obs.cam_R.flatten(-2)], dim=-1))
-    e_hist = torch.cat(feats).view(F, n, -1)
-    cam_hist = torch.cat(cams).view(F, n, -1)
+    init_frame = getattr(step_fn, "init_frame", None)
+    if init_frame is None:  # eager fallback (tests drive this with a stand-in step function)
+
+        def init_frame(q, o, prm, g):
+            obs = ds.observe(q, o, prm, g, noise)
+            return torch.cat([pol.depth.encoder(obs.img), obs.g_cam], dim=-1), torch.cat([obs.cam_pos, obs.cam_R.flatten(-2)], dim=-1)
+
+    # ``rows`` frame rows (x all starts) per call, the last chunk padded: few launches, one compiled shape. The camera
+    # parameters are per start; the lag already chose the state.
+    rows = 8
+    Fp = -(-F // rows) * rows
+    qpad = torch.cat([qcap, qcap[-1:].expand(Fp - F, n, 36)]) if Fp > F else qcap
+    rep = lambda x: x[None].expand(rows, *x.shape).reshape(rows * n, *x.shape[1:])  # noqa: E731
+    prm, org = type(dparams)(*(rep(x) for x in dparams)), rep(start.origin)
+    feats, cams = zip(*(init_frame(qpad[i : i + rows].reshape(rows * n, 36), org, prm, grid) for i in range(0, Fp, rows)))
+    e_hist = torch.cat(feats).view(Fp, n, -1)[:F]
+    cam_hist = torch.cat(cams).view(Fp, n, -1)[:F]
     q_hist = hs[Hh - 1 - L : Hh - 1, :, :36].clone()
     return dparams, q_hist, e_hist, cam_hist

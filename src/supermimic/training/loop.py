@@ -117,6 +117,9 @@ class Trainer:
                 from supermimic.terrain.depth import DepthSensor
 
                 self.depth = DepthSensor(tcfg.depth, fk, self.command.tmap)
+                # mjlab enables cudnn.benchmark; for the depth CNN every new batch shape then autotunes with multi-GB
+                # workspaces that the caching allocator keeps, starving MuJoCo Warp (graph-launch OOM). The convs are tiny.
+                torch.backends.cudnn.benchmark = False
         self.wm = WorldModel(cfg.world_model, heads, self.device, terrain=self.terrain)
         self.policy = Policy(cfg.policy).to(self.device)
         self.critic = Critic(cfg.critic, pcfg=cfg.policy).to(self.device)

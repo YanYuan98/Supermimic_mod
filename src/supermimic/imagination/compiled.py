@@ -95,6 +95,8 @@ class ImagStep:
             self.depth_noise = obs_noise and depth.cfg.noise
         step = self._step if terrain is None else (self._step_depth if depth is not None else self._step_terrain)
         self._fn = _compile(step, compile_mode)
+        if depth is not None:
+            self._init_frame_fn = _compile(self._init_frame, compile_mode)
         self._goal_fn = _compile(self.goal, compile_mode)
 
     def noisy(self, o: torch.Tensor) -> torch.Tensor:
@@ -135,22 +137,24 @@ class ImagStep:
         return self._fn(s, hist, scan_hist, goal_ref, ref_anchor_pos, ref_anchor_quat, xi, origin, noise, grid)
 
 
-    def _step_depth(self, s, hist, q_hist, e_hist, cam_hist, step, goal_ref, ref_anchor_pos, ref_anchor_quat, xi, origin, dparams, grid):
-        from supermimic.terrain.depth import push_rows
+    def _step_depth(self, s, hist, q_hist, e_hist, cam_hist, sample, goal_ref, ref_anchor_pos, ref_anchor_quat, xi, origin, dparams, grid):
+        from torch.utils.checkpoint import checkpoint
 
         ds, pol = self.depth, self.policy
         L = q_hist.shape[0]
         q_hist = torch.cat([q_hist[1:], s[None, :, :36]], dim=0)  # newest = s_t
-        lag, drop = ds.frame_draws(dparams, self.depth_noise)
-        qcap = torch.gather(q_hist, 0, (L - 1 - lag).view(1, -1, 1).expand(1, q_hist.shape[1], 36))[0]
-        obs = ds.observe(qcap, origin, dparams, grid, self.depth_noise)
-        feat = torch.cat([pol.depth.encoder(obs.img), obs.g_cam], dim=-1)
-        cam = torch.cat([obs.cam_pos, obs.cam_R.flatten(-2)], dim=-1)
-        sample = ds.is_sample_step(step, dparams)
-        feat = torch.where(drop[:, None], e_hist[-1], feat)
-        cam = torch.where(drop[:, None], cam_hist[-1], cam)
-        e_hist = push_rows(e_hist, feat, sample)
-        cam_hist = push_rows(cam_hist, cam, sample)
+        if sample:  # python bool: one compiled graph for sample steps, one for the others
+            lag, drop = ds.frame_draws(dparams, self.depth_noise)
+            qcap = torch.gather(q_hist, 0, (L - 1 - lag).view(1, -1, 1).expand(1, q_hist.shape[1], 36))[0]
+            obs = ds.observe(qcap, origin, dparams, grid, self.depth_noise)
+            # Activation checkpointing: only the image is kept for the backward pass (the convs are recomputed).
+            e = checkpoint(pol.depth.encoder, obs.img, use_reentrant=False)
+            feat = torch.cat([e, obs.g_cam], dim=-1)
+            cam = torch.cat([obs.cam_pos, obs.cam_R.flatten(-2)], dim=-1)
+            feat = torch.where(drop[:, None], e_hist[-1], feat)
+            cam = torch.where(drop[:, None], cam_hist[-1], cam)
+            e_hist = torch.cat([e_hist[1:], feat[None]], dim=0)
+            cam_hist = torch.cat([cam_hist[1:], cam[None]], dim=0)
         idx = ds.slot_idx
         z_terr, h = pol.depth.latent(e_hist[idx].transpose(0, 1))
         # Auxiliary-loss mask: scan cells of the current state inside a slot camera's frustum.
@@ -167,10 +171,19 @@ class ImagStep:
         o = self.noisy(analytic_observation(s_next, a, xi, self.q0))
         return s_next, a, torch.cat([hist[1:], o[None]], dim=0), q_hist, e_hist, cam_hist, g, h, vis
 
-    def step_depth(self, s, hist, q_hist, e_hist, cam_hist, step, goal_ref, ref_anchor_pos, ref_anchor_quat, xi, origin, dparams: DepthParams, grid):
-        """-> (s_{t+1}, a_t, history', qpos history', frame history', camera history', g_t, h_t, aux mask);
-        ``step`` a 0-d long tensor (no recompilation per step)."""
-        return self._fn(s, hist, q_hist, e_hist, cam_hist, step, goal_ref, ref_anchor_pos, ref_anchor_quat, xi, origin, dparams, grid)
+    def _init_frame(self, qpos, origin, dparams, grid):
+        obs = self.depth.observe(qpos, origin, dparams, grid, self.depth_noise)
+        return torch.cat([self.policy.depth.encoder(obs.img), obs.g_cam], dim=-1), torch.cat([obs.cam_pos, obs.cam_R.flatten(-2)], dim=-1)
+
+    def init_frame(self, qpos, origin, dparams: DepthParams, grid):
+        """(frame feature [e, g_cam], true camera pose (pos, R)) of one history frame per start (no gradient)."""
+        return self._init_frame_fn(qpos, origin, dparams, grid)
+
+    def step_depth(self, s, hist, q_hist, e_hist, cam_hist, sample: bool, goal_ref, ref_anchor_pos, ref_anchor_quat, xi, origin, dparams: DepthParams, grid):
+        """-> (s_{t+1}, a_t, history', qpos history', frame history', camera history', g_t, h_t, aux mask). ``sample``:
+        whether step t is a frame-sample step (the imagination uses one phase for the whole batch, so this is a
+        Python bool and non-sample steps skip rendering and encoding)."""
+        return self._fn(s, hist, q_hist, e_hist, cam_hist, sample, goal_ref, ref_anchor_pos, ref_anchor_quat, xi, origin, dparams, grid)
 
 
 class ImagHeads:
