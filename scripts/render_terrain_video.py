@@ -306,25 +306,17 @@ def draw_overlay(canvas: Image.Image, x0: int, y0: int, pw: int, ph: int, seg: S
         draw.text((x0 + (pw - mw) / 2, y0 + ph * 0.30), msg, font=fonts["fail"], fill=(215, 30, 30, 240), stroke_width=3, stroke_fill=(255, 255, 255, 200))
 
 
-_DEPTH_LUT = None
-
-
 def draw_depth_inset(canvas: Image.Image, x0: int, y0: int, pw: int, ph: int, seg: Seg, s: int, fonts: dict, k: float, full: bool) -> None:
-    """Right-side inset: the depth frame the policy sees at step s (turbo, near red / far blue, holes black)."""
-    global _DEPTH_LUT
+    """Right-side inset: the depth frame the policy sees at step s, as recorded (grey level = distance, 0.3 m dark ->
+    3 m white; holes 0 = black, like a raw D435 depth image). No colour map."""
     if seg.depth is None:
         return
-    if _DEPTH_LUT is None:
-        import matplotlib
-
-        lut = (matplotlib.colormaps["turbo"](np.linspace(0.95, 0.1, 255))[:, :3] * 255).astype(np.uint8)  # 1 = near -> red
-        _DEPTH_LUT = np.concatenate([np.zeros((1, 3), np.uint8), lut])
     fr = seg.depth[min(s, len(seg.depth) - 1)]
-    rgb = _DEPTH_LUT[fr]
+    rgb = np.repeat(fr[..., None], 3, axis=-1)
     scale = max(5, int(round(11 * k)))
     img = Image.fromarray(rgb).resize((rgb.shape[1] * scale, rgb.shape[0] * scale), Image.NEAREST)
     draw = ImageDraw.Draw(canvas, "RGBA")
-    lines = [f"策略输入：深度 {rgb.shape[1]}×{rgb.shape[0]}", "近红 远蓝 0.3–3 m · 黑 = 空洞/自遮挡"]
+    lines = [f"策略输入：原始深度 {rgb.shape[1]}×{rgb.shape[0]}", "灰度 = 距离 0.3→3 m · 黑 = 空洞/自遮挡"]
     lw = max(draw.textlength(t, font=fonts["small"]) for t in lines)
     lh = fonts["small"].size * 1.3
     pad = int(16 * k) + 4
