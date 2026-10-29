@@ -277,3 +277,46 @@ def test_training_smoke_depth(tmp_path):
 
     pol, _ = load_policy_from_checkpoint(tmp_path / "depth" / "ckpt_latest.pt", DEV)
     assert pol.depth is not None
+
+
+def test_relative_pose_of_current_camera_is_the_mount(fk, mixed):
+    """P* input convention: the current (unperturbed) camera seen from the current torso is the URDF mount, for any
+    root pose / joint angles."""
+    from supermimic.terrain.depth import relative_pose
+
+    _, tmap = mixed
+    cfg = DepthCfg(noise=False, pose_input="true")
+    ds = DepthSensor(cfg, fk, tmap)
+    q = _standing(fk, tmap, 32, seed=3)
+    q[:, 7:] = (torch.rand(32, 29, device=DEV) - 0.5) * 0.6
+    prm = sample_depth_params(32, cfg, DEV)
+    cam_o, cam_R, *_ = ds.cameras(q, prm)
+    tp, tq = fk.chain_pose(q, ds.torso)
+    rel = relative_pose(cam_o[None], cam_R[None], tp, tq)[0]
+    p = cfg.mount_pitch
+    mount = torch.tensor([*cfg.mount_pos, math.cos(p), 0.0, -math.sin(p), 0.0, 1.0, 0.0], device=DEV)
+    assert torch.allclose(rel, mount.expand_as(rel), atol=1e-5)
+
+
+def test_training_smoke_depth_pose(tmp_path):
+    """Ablation P*: per-slot relative pose (slot_dim 32 + 3 + 9) through simulator and imagination."""
+    from supermimic.config import TrainConfig
+    from supermimic.training.loop import Trainer
+
+    from tests.test_terrain_stack import _tiny
+
+    cfg = _tiny(TrainConfig(), "pose", tmp_path)
+    cfg.terrain.kind = "plane"
+    cfg.terrain.wm_terrain = "scan"
+    cfg.terrain.policy_obs = "depth"
+    cfg.terrain.depth.pose_input = "true"
+    cfg.schedule.total_iterations = 6
+    cfg.schedule.checkpoint_interval = 6
+    tr = Trainer(cfg)
+    assert tr.policy.depth.slot_dim == 44
+    imgs, extra = tr.command.depth_slots()
+    assert extra.shape[-1] == 12 and torch.isfinite(extra).all()
+    tr.run()
+    m = tr.policy_trainer.update(tr.buffer)
+    assert all(torch.isfinite(p).all() for p in tr.policy.parameters()) and m["depth/aux_loss"] > 0
+    tr.env.close()

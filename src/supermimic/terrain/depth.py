@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from supermimic.terrain.heightmap import HeightGrid, TerrainMap
 
 DEPTH_FEAT_EXTRA = 3  # g_cam appended to every frame feature
+POSE_DIMS = {"none": 0, "true": 9}  # relative pose appended per slot (ablation P*: position 3 + rot6d 6)
 
 
 @dataclass
@@ -75,6 +76,9 @@ class DepthCfg:
     # Frame history read by the policy: ``slots`` frames, ``slot_stride`` samples apart (newest first).
     slots: int = 16
     slot_stride: int = 3
+    # Per-slot pose of the frame's camera relative to the current torso (ablation): "none" (default, P0) |
+    # "true" (P*: the simulator's exact pose, an upper bound; not available on the robot).
+    pose_input: str = "none"
 
     @property
     def out_h(self) -> int:
@@ -512,6 +516,18 @@ def depth_edges(z: torch.Tensor, threshold: float) -> torch.Tensor:
     edge[:, :, 1:-1] |= (z[:, :, 2:] - 2 * z[:, :, 1:-1] + z[:, :, :-2]).abs() > threshold
     edge[:, 1:-1, :] |= (z[:, 2:, :] - 2 * z[:, 1:-1, :] + z[:, :-2, :]).abs() > threshold
     return edge
+
+
+def relative_pose(cam_pos: torch.Tensor, cam_R: torch.Tensor, torso_pos: torch.Tensor, torso_quat: torch.Tensor) -> torch.Tensor:
+    """(S, B, 9) pose of the slot cameras (S, B, 3) / (S, B, 3, 3), world, in the current torso frame (B, 3) / (B, 4):
+    position (3) and the first two columns of the relative rotation (6). Elementwise (no TF32 matmuls)."""
+    from supermimic.kinematics.rotations import quat_apply_inverse
+
+    q = torso_quat[None].expand(cam_pos.shape[0], -1, -1)
+    p = quat_apply_inverse(q, cam_pos - torso_pos[None])
+    c0 = quat_apply_inverse(q, cam_R[..., :, 0])
+    c1 = quat_apply_inverse(q, cam_R[..., :, 1])
+    return torch.cat([p, c0, c1], dim=-1)
 
 
 def push_rows(hist: torch.Tensor, entry: torch.Tensor, where: torch.Tensor) -> torch.Tensor:

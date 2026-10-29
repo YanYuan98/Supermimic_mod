@@ -181,6 +181,8 @@ class MultiClipMotionCommand(CommandTerm):
         self.depth_q = torch.zeros(dcfg.state_hist, n, 36, device=dev)  # world qpos, oldest -> newest
         self.depth_img = torch.zeros(dcfg.hist_frames, n, 2, dcfg.out_h, dcfg.width, device=dev, dtype=torch.float16)
         self.depth_g = torch.zeros(dcfg.hist_frames, n, 3, device=dev)
+        self.depth_pose = dcfg.pose_input != "none"
+        self.depth_cam = torch.zeros(dcfg.hist_frames, n, 12, device=dev) if self.depth_pose else None  # true pos | R
         self.depth_step = torch.zeros(n, dtype=torch.long, device=dev)
         self._depth_reset = torch.ones(n, dtype=torch.bool, device=dev)
         self._depth_zero_origin = torch.zeros(n, 3, device=dev)
@@ -188,9 +190,17 @@ class MultiClipMotionCommand(CommandTerm):
         self._depth_observe = torch.compile(self.depth_sensor.observe, dynamic=False)
 
     def depth_slots(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """(images (S, N, 2, H, W) fp16, g_cam (S, N, 3)) of the frames the policy reads, oldest first."""
+        """(images (S, N, 2, H, W) fp16, extras (S, N, 3 [+ 9])) of the frames the policy reads, oldest first: g_cam
+        [+ the frame camera's pose relative to the current torso, ablation P*]."""
         idx = self.depth_sensor.slot_idx
-        return self.depth_img[idx], self.depth_g[idx]
+        g = self.depth_g[idx]
+        if self.depth_pose:
+            from supermimic.terrain.depth import relative_pose
+
+            cam = self.depth_cam[idx]
+            tp, tq = self.fk.chain_pose(self._env.sim.data.qpos[:][:, :36], self.depth_sensor.torso)
+            g = torch.cat([g, relative_pose(cam[..., 0:3], cam[..., 3:12].unflatten(-1, (3, 3)), tp, tq)], dim=-1)
+        return self.depth_img[idx], g
 
     def _update_depth(self, env_ids: torch.Tensor | None) -> None:
         """Advance the depth camera of ``env_ids`` by one control step (qpos is fresh, see ``_update_scan``)."""
@@ -217,6 +227,14 @@ class MultiClipMotionCommand(CommandTerm):
         g = torch.where(drop.view(-1, 1), g_h[-1], obs.g_cam)
         img_new = torch.where(reset.view(1, -1, 1, 1, 1), img[None].expand_as(img_h), push_rows(img_h, img, sample))
         g_new = torch.where(reset.view(1, -1, 1), g[None].expand_as(g_h), push_rows(g_h, g, sample))
+        if self.depth_pose:
+            cam_h = self.depth_cam[:, ids]
+            cam = torch.where(drop.view(-1, 1), cam_h[-1], torch.cat([obs.cam_pos, obs.cam_R.flatten(-2)], dim=-1))
+            cam_new = torch.where(reset.view(1, -1, 1), cam[None].expand_as(cam_h), push_rows(cam_h, cam, sample))
+            if full:
+                self.depth_cam.copy_(cam_new)
+            else:
+                self.depth_cam[:, ids] = cam_new
         if full:
             self.depth_q.copy_(qh)
             self.depth_img.copy_(img_new)

@@ -56,6 +56,7 @@ class PolicyCfg:
     depth_agg_hidden: int = 256
     depth_aux_hidden: int = 256
     depth_aux_dim: int = 187  # noise-free scan predicted by the auxiliary head
+    depth_pose_dim: int = 0  # per-slot relative pose (DepthCfg.pose_input; set by the trainer)
 
 
 @dataclass
@@ -159,7 +160,7 @@ class DepthModules(nn.Module):
         from supermimic.terrain.depth import DEPTH_FEAT_EXTRA
 
         act = getattr(cfg, "activation", "elu")
-        self.slot_dim = cfg.depth_feat_dim + DEPTH_FEAT_EXTRA
+        self.slot_dim = cfg.depth_feat_dim + DEPTH_FEAT_EXTRA + getattr(cfg, "depth_pose_dim", 0)
         self.encoder = DepthEncoder(cfg)
         self.agg_in = MLP(cfg.depth_slots * self.slot_dim, (), cfg.depth_agg_hidden)  # one Linear; activation below
         self.agg_act = ACTIVATIONS[act]()
@@ -219,7 +220,8 @@ class Policy(nn.Module):
         return self.decoder(z, obs_hist, self.terrain(scan))
 
     def encode_slots(self, imgs: torch.Tensor, g_cam: torch.Tensor) -> torch.Tensor:
-        """imgs (S, N, 2, H, W), g_cam (S, N, 3) of the slot frames (oldest first) -> depth_slots (N, S, slot_dim)."""
+        """imgs (S, N, 2, H, W), per-frame extras (S, N, 3 [+ pose]) of the slot frames (oldest first) -> depth_slots
+        (N, S, slot_dim)."""
         e = self.depth.encoder(imgs.float())
         return torch.cat([e, g_cam.to(e.dtype)], dim=-1).transpose(0, 1)
 

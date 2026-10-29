@@ -47,6 +47,9 @@ class Trainer:
         if use_depth:
             cfg.policy.depth_hw = (tcfg.depth.out_h, tcfg.depth.width)
             cfg.policy.depth_slots = tcfg.depth.slots
+            from supermimic.terrain.depth import POSE_DIMS
+
+            cfg.policy.depth_pose_dim = POSE_DIMS[tcfg.depth.pose_input]
             cfg.policy.depth_aux_dim = SCAN_DIM
         cfg.critic.terrain_dim = CRITIC_TERRAIN_DIM if terrain_on else 0
         cfg.world_model.terrain = tcfg.wm_terrain if terrain_on else "none"

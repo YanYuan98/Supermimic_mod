@@ -156,7 +156,16 @@ class ImagStep:
             e_hist = torch.cat([e_hist[1:], feat[None]], dim=0)
             cam_hist = torch.cat([cam_hist[1:], cam[None]], dim=0)
         idx = ds.slot_idx
-        z_terr, h = pol.depth.latent(e_hist[idx].transpose(0, 1))
+        slots = e_hist[idx]
+        if ds.cfg.pose_input != "none":  # ablation P*: exact pose of each slot camera relative to the current torso
+            from supermimic.terrain.depth import relative_pose
+
+            with torch.no_grad():
+                tp, tq = self.wm.heads.fk.chain_pose(s[:, :36].detach(), self.depth.torso)
+                cs = cam_hist[idx]
+                rel = relative_pose(cs[..., 0:3], cs[..., 3:12].unflatten(-1, (3, 3)), tp + origin, tq)
+            slots = torch.cat([slots, rel], dim=-1)
+        z_terr, h = pol.depth.latent(slots.transpose(0, 1))
         # Auxiliary-loss mask: scan cells of the current state inside a slot camera's frustum.
         with torch.no_grad():
             tm = self.terrain.tmap
