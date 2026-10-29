@@ -174,6 +174,7 @@ class Seg:
         self.col, self.row = meta["terrain"]["col"], meta["terrain"]["row"]
         self.platform = meta["terrain"].get("stairs_platform")
         self.t = rc.Track(roll, i, world=True)
+        self.depth = roll[f"s{i}_depth"] if f"s{i}_depth" in roll.files else None  # policy depth frames (depth policies)
         self.lo = int(round(cfg["start_s"] / DT))
         self.hi = min(self.lo + int(round(duration_s / DT)), self.t.n)
         assert self.hi > self.lo, (cfg, self.t.n)
@@ -291,10 +292,50 @@ def draw_overlay(canvas: Image.Image, x0: int, y0: int, pw: int, ph: int, seg: S
             ys = gy1 - 0.5 * pad - (gh - pad) * np.clip(np.nan_to_num(e), 0, top) / top
             draw.line(list(zip(xs.tolist(), ys.tolist())), fill=(235, 120, 20), width=3)
         rc.draw_minimap(draw, {"small": fonts["small"]}, x0 + pw - rc.MAP - pad - 8, int(by + bh + 70 * k + 40), t, seg.lo, s)
+    draw_depth_inset(canvas, x0, y0, pw, ph, seg, s, fonts, k, full)
+    if seg.cfg.get("label"):  # policy tag under the info box (side-by-side comparisons)
+        tag = seg.cfg["label"]
+        tw = draw.textlength(tag, font=fonts["badge"])
+        ty = y0 + pad + sum(heights) + 1.4 * pad + pad
+        col = tuple(seg.cfg.get("label_color", (40, 90, 200)))
+        draw.rounded_rectangle([x0 + pad, ty, x0 + pad + tw + 2 * pad, ty + fonts["badge"].size * 1.45], radius=int(10 * k) + 2, fill=(*col, 230))
+        draw.text((x0 + 2 * pad, ty + 0.12 * fonts["badge"].size * 1.45), tag, font=fonts["badge"], fill=(255, 255, 255))
     if failed:
         msg = "摔倒 / 终止" if seg.fell else "触发终止（未摔倒）"
         mw = draw.textlength(msg, font=fonts["fail"])
         draw.text((x0 + (pw - mw) / 2, y0 + ph * 0.30), msg, font=fonts["fail"], fill=(215, 30, 30, 240), stroke_width=3, stroke_fill=(255, 255, 255, 200))
+
+
+_DEPTH_LUT = None
+
+
+def draw_depth_inset(canvas: Image.Image, x0: int, y0: int, pw: int, ph: int, seg: Seg, s: int, fonts: dict, k: float, full: bool) -> None:
+    """Right-side inset: the depth frame the policy sees at step s (turbo, near red / far blue, holes black)."""
+    global _DEPTH_LUT
+    if seg.depth is None:
+        return
+    if _DEPTH_LUT is None:
+        import matplotlib
+
+        lut = (matplotlib.colormaps["turbo"](np.linspace(0.95, 0.1, 255))[:, :3] * 255).astype(np.uint8)  # 1 = near -> red
+        _DEPTH_LUT = np.concatenate([np.zeros((1, 3), np.uint8), lut])
+    fr = seg.depth[min(s, len(seg.depth) - 1)]
+    rgb = _DEPTH_LUT[fr]
+    scale = max(5, int(round(11 * k)))
+    img = Image.fromarray(rgb).resize((rgb.shape[1] * scale, rgb.shape[0] * scale), Image.NEAREST)
+    draw = ImageDraw.Draw(canvas, "RGBA")
+    lines = [f"策略输入：深度 {rgb.shape[1]}×{rgb.shape[0]}", "近红 远蓝 0.3–3 m · 黑 = 空洞/自遮挡"]
+    lw = max(draw.textlength(t, font=fonts["small"]) for t in lines)
+    lh = fonts["small"].size * 1.3
+    pad = int(16 * k) + 4
+    bw = max(img.width, lw) + 16
+    bx1 = x0 + pw - pad
+    bx = bx1 - bw
+    by = y0 + int(ph * (0.42 if full else 0.17))
+    draw.rounded_rectangle([bx, by, bx1, by + 2 * lh + img.height + 16], radius=8, fill=(20, 24, 32, 205))
+    for i, t in enumerate(lines):
+        draw.text((bx + 8, by + 4 + i * lh), t, font=fonts["small"], fill=(255, 255, 255))
+    canvas.paste(img, (int(bx + (bw - img.width) / 2), int(by + 2 * lh + 8)))
 
 
 def render_seg_frame(renderer, model, robot, ghost, opt, seg: Seg, f: int) -> tuple[np.ndarray, int]:

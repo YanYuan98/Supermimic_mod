@@ -7,7 +7,8 @@ the first step at which the training termination would have fired is recorded in
 
 Output (npz, one ``s{i}_`` prefix per clip, sample k = state after k control steps, compared with
 reference frame k): root_pos (origin-free), root_quat (wxyz), joint_pos, ref_root_pos,
-ref_root_quat, ref_joint_pos, plus ``metadata_json`` {dt, segments: [{clip, start_frame,
+ref_root_quat, ref_joint_pos (depth policies also ``depth``: the newest frame the policy sees, (T, H, W) uint8,
+0 = hole, 1..255 = near..far clip), plus ``metadata_json`` {dt, segments: [{clip, start_frame,
 end_frame, first_failure_frame}]}.
 
 Terrain checkpoints run on the plane by default; ``--terrain mixed --terrain-col stairs_up --terrain-row 6``
@@ -91,6 +92,8 @@ def main(
         lengths = lib.clip_len.cpu().numpy()
         T = int(lengths.max())
         rec = {k: [] for k in ("root_pos", "root_quat", "joint_pos", "ref_root_pos", "ref_root_quat", "ref_joint_pos")}
+        if getattr(cmd, "depth_sensor", None) is not None:
+            rec["depth"] = []
         failed_at = np.full(n, -1)
         with torch.inference_mode():
             obs, _ = env.reset()
@@ -110,6 +113,9 @@ def main(
                 rec["ref_root_pos"].append(ref.root_pos_w)
                 rec["ref_root_quat"].append(ref.root_quat_w)
                 rec["ref_joint_pos"].append(ref.joint_pos)
+                if "depth" in rec:  # newest frame of the policy's history: normalised depth (-1 near .. 1 far) + validity
+                    img = cmd.depth_img[-1].float()
+                    rec["depth"].append(torch.where(img[:, 1] > 0.5, (img[:, 0].clamp(-1, 1) + 1) * 127 + 1, torch.zeros_like(img[:, 0])).to(torch.uint8))
                 # Training termination (paper App. A): pelvis height / tilt vs the reference root.
                 dz = (ref.root_pos_w[:, 2] - s[:, 2]).abs()
                 tilt = (projected_gravity(ref.root_quat_w)[:, 2] - projected_gravity(s[:, 3:7])[:, 2]).abs()
