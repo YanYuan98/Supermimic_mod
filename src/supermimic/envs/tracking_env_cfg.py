@@ -112,6 +112,8 @@ class SuperMimicEnvCfgArgs:
     terrain_border: float = 4.0
     terrain_res: float = 0.025
     terrain_level: int = 2  # initial curriculum level (max spawn row)
+    terrain_stairs_platform: float | None = None  # m, central platform of the stairs columns (None: 7.4 m)
+    terrain_slope_platform: float | None = None  # m, central platform of the slope columns (None: 3.0 m)
     terrain_cache_dir: str | None = "logs/terrain_cache"
     spawn_margin: float = 0.5
     scan_noise: ScanNoiseCfg = field(default_factory=ScanNoiseCfg)  # applied only with obs_noise (or scan_noise_always)
@@ -283,7 +285,10 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
     if a.terrain == "mixed":
         from supermimic.terrain import make_terrain_generator_cfg
 
-        gen = make_terrain_generator_cfg("mixed", seed=a.terrain_seed, size=a.terrain_size, num_rows=a.terrain_rows, border=a.terrain_border)
+        gen = make_terrain_generator_cfg(
+            "mixed", seed=a.terrain_seed, size=a.terrain_size, num_rows=a.terrain_rows, border=a.terrain_border,
+            stairs_platform=a.terrain_stairs_platform, slope_platform=a.terrain_slope_platform,
+        )
         terrain = TerrainEntityCfg(terrain_type="generator", terrain_generator=gen)
         robot_cfg.spec_fn = _raised_spec_fn(robot_cfg.spec_fn)
     else:

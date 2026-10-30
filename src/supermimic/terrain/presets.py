@@ -108,18 +108,20 @@ _MJLAB_CFG = {
 }
 
 
-def mixed_sub_terrains(size: float = 12.0, solid: bool = True, stairs_platform: float | None = None) -> dict[str, SubTerrainCfg]:
+def mixed_sub_terrains(
+    size: float = 12.0, solid: bool = True, stairs_platform: float | None = None, slope_platform: float | None = None
+) -> dict[str, SubTerrainCfg]:
     """The 9 column types of plan §2.7 (order = column index). ``solid=False`` returns mjlab's own configs
     (thin stair boxes / height-field bases at low difficulty, see ``MIN_TERRAIN_THICKNESS``; diagnostics only).
     ``stairs_platform`` (evaluation / video only, never used in training): platform width of both stairs columns
-    instead of the 6-step default; more steps per side, see ``stairs_layout``."""
-    stairs = {
-        "step_height_range": (0.02, 0.15),
-        "step_width": STAIR_TREAD,
-        "platform_width": round(size - 2 * STAIR_FRAME - 2 * STAIR_STEPS * STAIR_TREAD, 6) if stairs_platform is None else float(stairs_platform),  # 7.4 m on a 12 m tile
-        "border_width": STAIR_FRAME,
-    }
-    slope = {"slope_range": (0.0, 0.36), "platform_width": 3.0, "border_width": 0.25}
+    instead of the 6-step default; more steps per side, see ``stairs_layout``. ``slope_platform`` (same, evaluation /
+    video only): central platform of both slope columns instead of 3 m."""
+    if stairs_platform is None:
+        stair_platform, stair_frame = round(size - 2 * STAIR_FRAME - 2 * STAIR_STEPS * STAIR_TREAD, 6), STAIR_FRAME  # 7.4 m on a 12 m tile
+    else:  # mjlab floors the step count: pass a hair less so the platform box (the remainder) is exactly the request
+        stair_platform, stair_frame = float(stairs_platform) - 1e-6, stairs_frame(size, stairs_platform)[1]
+    stairs = {"step_height_range": (0.02, 0.15), "step_width": STAIR_TREAD, "platform_width": stair_platform, "border_width": stair_frame}
+    slope = {"slope_range": (0.0, 0.36), "platform_width": 3.0 if slope_platform is None else float(slope_platform), "border_width": 0.25}
     c = (lambda cls: cls) if solid else (lambda cls: _MJLAB_CFG[cls])  # noqa: E731
     subs: dict[str, SubTerrainCfg] = {
         "flat": T.BoxFlatTerrainCfg(proportion=0.10),  # one 1 m thick box (mjlab make_plane)
@@ -141,27 +143,41 @@ def mixed_sub_terrains(size: float = 12.0, solid: bool = True, stairs_platform: 
     return subs
 
 
+def stairs_frame(size: float, platform: float) -> tuple[int, float]:
+    """(steps per side, frame width) of the stairs variant whose central platform is exactly ``platform``: 30 cm treads
+    as in training, the step count that keeps the frame nearest to 0.5 m, the frame takes the rest (1.4 m: 16 steps,
+    0.5 m frame; 1.5 m: 16 steps, 0.45 m frame)."""
+    n = round((size - 2 * STAIR_FRAME - platform) / (2 * STAIR_TREAD))
+    return n, round((size - platform - 2 * n * STAIR_TREAD) / 2, 6)
+
+
 def stairs_layout(size: float = 12.0, platform_width: float | None = None) -> tuple[int, float]:
-    """(steps per side, actual platform side) of the stairs columns: mjlab rounds the step count down, the central
-    box takes the rest. The platform top is (steps + 1) step heights above (pyramid) / below (pit) the frame."""
-    p = round(size - 2 * STAIR_FRAME - 2 * STAIR_STEPS * STAIR_TREAD, 6) if platform_width is None else platform_width
-    n = int((size - 2 * STAIR_FRAME - p) / (2 * STAIR_TREAD))
-    return n, round(size - 2 * STAIR_FRAME - 2 * n * STAIR_TREAD, 6)
+    """(steps per side, platform side) of the stairs columns (``platform_width``: the ``stairs_platform`` variant, see
+    ``stairs_frame``). The platform top is (steps + 1) step heights above (pyramid) / below (pit) the frame."""
+    if platform_width is None:
+        return STAIR_STEPS, round(size - 2 * STAIR_FRAME - 2 * STAIR_STEPS * STAIR_TREAD, 6)
+    return stairs_frame(size, platform_width)[0], float(platform_width)
 
 
 def make_terrain_generator_cfg(
-    kind: str, seed: int, size: float = 12.0, num_rows: int = 10, border: float = 4.0, stairs_platform: float | None = None
+    kind: str,
+    seed: int,
+    size: float = 12.0,
+    num_rows: int = 10,
+    border: float = 4.0,
+    stairs_platform: float | None = None,
+    slope_platform: float | None = None,
 ) -> TerrainGeneratorCfg | None:
     """mjlab generator config for ``kind`` (``None`` for ``plane``). The seed must be explicit: with
     ``seed=None`` mjlab falls back to the per-rank numpy RNG and every rank would build a different map.
-    ``stairs_platform``: evaluation / video-only stairs variant (see ``mixed_sub_terrains``); ``None`` = training map."""
+    ``stairs_platform`` / ``slope_platform``: evaluation / video-only variants (see ``mixed_sub_terrains``); ``None`` = training map."""
     if kind not in TERRAIN_KINDS:
         raise ValueError(f"unknown terrain kind {kind!r}; expected one of {TERRAIN_KINDS}")
     if kind == "plane":
         return None
     if seed is None:
         raise ValueError("terrain seed must be explicit (identical on every rank)")
-    subs = mixed_sub_terrains(size, stairs_platform=stairs_platform)
+    subs = mixed_sub_terrains(size, stairs_platform=stairs_platform, slope_platform=slope_platform)
     return TerrainGeneratorCfg(
         seed=int(seed),
         curriculum=True,

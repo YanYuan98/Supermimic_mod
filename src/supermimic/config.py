@@ -98,6 +98,12 @@ class TerrainCfg:
     # Policy terrain input: "scan" (noisy 17x11 height scan) | "depth" (rendered D435 frames, terrain/depth.py).
     # The world model and the critic keep their noise-free terrain features either way.
     policy_obs: Literal["scan", "depth"] = "scan"
+    # Central flat platform of the curriculum tiles ("mixed"). stairs_platform: flat top width in m (None = 7.4 m with 6
+    # steps per side; 1.5 = 16 steps per side in a 0.45 m frame, measured 1.47 m). slope_platform: mjlab's
+    # HfPyramidSloped platform_width, which is NOT the flat width (None = 3.0 -> 5.2 m flat; 0.85 -> 1.44-1.47 m on rows
+    # >= 5, 1.7 m on row 1). Blocks keep their 1.0 m platform; rough / wave / perlin have none.
+    stairs_platform: float | None = None
+    slope_platform: float | None = None
     depth: DepthCfg = field(default_factory=DepthCfg)
     grad: bool = False  # True: let gradients flow through the terrain slope (bilinear weights); default detached
     curriculum: TerrainCurriculumCfg = field(default_factory=TerrainCurriculumCfg)
@@ -159,4 +165,5 @@ def terrain_env_kwargs(tcfg) -> dict:
         out["depth"] = DepthCfg(**t["depth"])
     if t["kind"] == "mixed":
         out.update(njmax=t["njmax"], nconmax=t["nconmax"], ccd_iterations=t["ccd_iterations"])
+        out.update(terrain_stairs_platform=t.get("stairs_platform"), terrain_slope_platform=t.get("slope_platform"))
     return out

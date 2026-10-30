@@ -320,3 +320,42 @@ def test_training_smoke_depth_pose(tmp_path):
     m = tr.policy_trainer.update(tr.buffer)
     assert all(torch.isfinite(p).all() for p in tr.policy.parameters()) and m["depth/aux_loss"] > 0
     tr.env.close()
+
+
+def test_training_terrain_with_narrow_platforms(tmp_path):
+    """TerrainCfg.stairs_platform = 1.5 / slope_platform = 0.85 reach the training map: the flat top of the stairs and
+    slope tiles is about 1.5 m wide (mjlab's slope ``platform_width`` is not the flat width: 0.85 -> 1.44-1.47 m on
+    rows >= 5, 3.0 -> 5.2 m), and a tiny mixed training run works on it."""
+    from supermimic.config import TrainConfig, terrain_env_kwargs
+    from supermimic.terrain.heightmap import TerrainMap, TerrainMapCfg
+    from supermimic.terrain.presets import TerrainLayout, compile_terrain, make_terrain_generator_cfg
+
+    from tests.test_terrain_stack import _tiny
+
+    cfg = _tiny(TrainConfig(), "p15", tmp_path)
+    cfg.terrain.kind, cfg.terrain.num_rows, cfg.terrain.wm_terrain, cfg.terrain.policy_obs = "mixed", 3, "scan", "depth"
+    cfg.terrain.stairs_platform, cfg.terrain.slope_platform = 1.5, 0.85
+    kw = terrain_env_kwargs(cfg.terrain)
+    assert kw["terrain_stairs_platform"] == 1.5 and kw["terrain_slope_platform"] == 0.85
+    gc = make_terrain_generator_cfg("mixed", seed=0, num_rows=3, stairs_platform=1.5, slope_platform=0.85)
+    m, _ = compile_terrain(gc)
+    tm = TerrainMap.build(m, gc, DEV, TerrainMapCfg(cache_dir=str(tmp_path / "cache")))
+    lay = TerrainLayout.from_generator_cfg(gc)
+    centres = lay.tile_centres(DEV)  # (rows, cols, 2)
+    xs = torch.linspace(-3, 3, 1201, device=DEV)
+    for col in ("stairs_down", "stairs_up", "slope_down", "slope_up"):
+        c = centres[2, lay.col_index(col)]
+        h = tm.height(torch.stack([c[0] + xs, c[1].expand_as(xs)], -1))
+        flat = (h - h[600]).abs() < 0.005
+        i0 = 600 - int(torch.nonzero(~flat[:601].flip(0))[0])
+        i1 = 600 + int(torch.nonzero(~flat[600:])[0])
+        width = float(xs[i1 - 1] - xs[i0 + 1])
+        assert abs(width - 1.5) < 0.1, (col, width)
+    from supermimic.training.loop import Trainer
+
+    cfg.schedule.total_iterations = 4
+    cfg.schedule.checkpoint_interval = 4
+    tr = Trainer(cfg)
+    tr.run()
+    assert all(torch.isfinite(p).all() for p in tr.policy.parameters())
+    tr.env.close()
