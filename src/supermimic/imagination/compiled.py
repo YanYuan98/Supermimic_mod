@@ -213,8 +213,9 @@ class ImagHeads:
     def critic_terrain(self, states, origin, grid):
         return self._terrain_fn(states, origin, grid)
 
-    def _heads(self, states, actions, prev_actions, ref_body_pos, ref_body_quat, ref_body_lin, ref_body_ang, ref_root_pos, ref_root_quat, ref_joint_pos):
-        """states (H+1, n, 71); actions / prev_actions (H, n, 29); reference tensors for frames 0..H."""
+    def _heads(self, states, actions, prev_actions, ref_body_pos, ref_body_quat, ref_body_lin, ref_body_ang, ref_root_pos, ref_root_quat, ref_joint_pos, term_offset=None):
+        """states (H+1, n, 71); actions / prev_actions (H, n, 29); reference tensors for frames 0..H; ``term_offset``
+        (H, n) ground-relative termination offset of s_1..s_H (``height_termination = "ground"``) or None."""
         H1, n = states.shape[:2]
         H = H1 - 1
         heads = self.wm.heads
@@ -226,7 +227,7 @@ class ImagHeads:
         nxt = {k: v[n:] for k, v in bodies.items()}
         terms = heads.reward(flat[n:], actions.reshape(H * n, -1), prev_actions.reshape(H * n, -1), tgt, nxt)
         term_vec = torch.stack([terms[k].reshape(H, n) for k in REWARD_TERM_NAMES], dim=0)  # (8, H, n)
-        logits = self.wm.termination_logits(flat[n:], tgt).reshape(H, n)
+        logits = self.wm.termination_logits(flat[n:], tgt, None if term_offset is None else term_offset.reshape(H * n)).reshape(H, n)
         # Critic features of s_t against target frame t (t = 0..H).
         if self.critic_features:
             crit = heads.critic_error_features(flat, ref, bodies)
@@ -234,5 +235,5 @@ class ImagHeads:
             crit = heads.root_error_features(flat, ref)
         return terms["total"].reshape(H, n), term_vec, logits, crit.reshape(H1, n, -1)
 
-    def __call__(self, states, actions, prev_actions, ref: ReferenceFrame):
-        return self._fn(states, actions, prev_actions, ref.body_pos_w, ref.body_quat_w, ref.body_lin_vel_w, ref.body_ang_vel_w, ref.root_pos_w, ref.root_quat_w, ref.joint_pos)
+    def __call__(self, states, actions, prev_actions, ref: ReferenceFrame, term_offset=None):
+        return self._fn(states, actions, prev_actions, ref.body_pos_w, ref.body_quat_w, ref.body_lin_vel_w, ref.body_ang_vel_w, ref.root_pos_w, ref.root_quat_w, ref.joint_pos, term_offset)

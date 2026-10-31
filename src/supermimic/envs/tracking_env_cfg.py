@@ -95,6 +95,7 @@ class SuperMimicEnvCfgArgs:
     record_transitions: bool = True
     seed: int | None = 0
     root_height_threshold: float = 0.25
+    height_termination: str = "reference"  # "reference" | "ground" (terrain only: heights above the local ground)
     root_tilt_threshold: float = 0.8
     joint_limit_weight: float = -2.0
     bin_frames: int = 50
@@ -269,7 +270,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
     terminations = {
         "time_out": TerminationTermCfg(func=base_mdp.time_out, time_out=True),
         "clip_end": TerminationTermCfg(func=sm_term.clip_end, params={"command_name": "motion"}, time_out=True),
-        "root_height": TerminationTermCfg(func=sm_term.bad_root_height, params={"command_name": "motion", "threshold": a.root_height_threshold}),
+        "root_height": TerminationTermCfg(func=sm_term.bad_root_height, params={"command_name": "motion", "threshold": a.root_height_threshold, **({"relative_to_ground": True} if a.height_termination == "ground" else {})}),
         "root_tilt": TerminationTermCfg(func=sm_term.bad_root_tilt, params={"command_name": "motion", "threshold": a.root_tilt_threshold}),
     }
 

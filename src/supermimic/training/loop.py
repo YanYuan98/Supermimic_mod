@@ -53,6 +53,7 @@ class Trainer:
             cfg.policy.depth_aux_dim = SCAN_DIM
         cfg.critic.terrain_dim = CRITIC_TERRAIN_DIM if terrain_on else 0
         cfg.world_model.terrain = tcfg.wm_terrain if terrain_on else "none"
+        cfg.world_model.height_termination = tcfg.height_termination if terrain_on else "reference"
         from supermimic.world_model import dynamics
 
         dynamics.AMP_DTYPE = {"none": None, "bf16": torch.bfloat16}[cfg.amp]

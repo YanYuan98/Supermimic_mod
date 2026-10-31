@@ -104,6 +104,10 @@ class TerrainCfg:
     # >= 5, 1.7 m on row 1). Blocks keep their 1.0 m platform; rough / wave / perlin have none.
     stairs_platform: float | None = None
     slope_platform: float | None = None
+    # Pelvis-height termination (simulator, world model, imagination): "reference" = absolute height vs the
+    # terrain-lifted reference (previous runs); "ground" = heights above the ground under each pelvis, so horizontal
+    # drift onto another tread or slope height is not a failure (the global position reward still penalises it).
+    height_termination: Literal["reference", "ground"] = "reference"
     depth: DepthCfg = field(default_factory=DepthCfg)
     grad: bool = False  # True: let gradients flow through the terrain slope (bilinear weights); default detached
     curriculum: TerrainCurriculumCfg = field(default_factory=TerrainCurriculumCfg)
@@ -161,6 +165,8 @@ def terrain_env_kwargs(tcfg) -> dict:
         spawn_margin=t["spawn_margin"],
         scan_noise=ScanNoiseCfg(**t["scan_noise"]),
     )
+    if t.get("height_termination", "reference") != "reference":
+        out["height_termination"] = t["height_termination"]
     if t.get("policy_obs", "scan") == "depth":
         out["depth"] = DepthCfg(**t["depth"])
     if t["kind"] == "mixed":

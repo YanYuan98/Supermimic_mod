@@ -59,6 +59,12 @@ class TerrainInputs:
         c = self.tmap.wm_condition(self.wm_mode, s, origin, self.fk, grid, scan_clean, self.detach)
         return c, self.ground_z(s, origin, grid)
 
+    def ground_offset(self, root_pos: torch.Tensor, ref_root_pos: torch.Tensor, origin: torch.Tensor, grid: HeightGrid | None = None) -> torch.Tensor:
+        """(...) ground under the robot pelvis minus ground under the reference pelvis (both relative to ``origin``; no
+        gradient): added to the termination height error for ``height_termination = "ground"``."""
+        o = origin[..., 0:2]
+        return (self.tmap.ground(root_pos[..., 0:2] + o, grid) - self.tmap.ground(ref_root_pos[..., 0:2] + o, grid)).detach()
+
     def critic_features(self, s: torch.Tensor, origin: torch.Tensor, grid: HeightGrid | None = None):
         """((..., 215) noise-free [foot features 28, scan 187], ground z (...))."""
         foot = self.tmap.foot_features(s, origin, self.fk, grid, self.detach)

@@ -121,10 +121,14 @@ def imagine(
     states = torch.stack(states)
     actions = torch.stack(actions)
     prev_actions = torch.cat([start.prev_action[None], actions[:-1]], dim=0)
-    rewards, term_vec, logits, crit = heads_fn(states, actions, prev_actions, ref)
-    crit_terr = ground_z = None
+    crit_terr = ground_z = term_offset = None
     if terrain is not None:
         crit_terr, ground_z = heads_fn.critic_terrain(states, start.origin, grid)
+        if getattr(step_fn.wm.cfg, "height_termination", "reference") == "ground":
+            # s_{t+1} is judged against target frame t: ground under s_1..s_H minus ground under reference roots 0..H-1.
+            ref_xy = ref.root_pos_w[: H * n].reshape(H, n, 3)
+            term_offset = terrain.ground_offset(states[1:, :, 0:3], ref_xy, start.origin[None], grid)
+    rewards, term_vec, logits, crit = heads_fn(states, actions, prev_actions, ref, term_offset)
     d = torch.sigmoid(logits)  # (H, n) termination probability of s_1..s_H
     survival = torch.cat([torch.ones(1, n, device=device), torch.cumprod(1.0 - d, dim=0)], dim=0)
     return ImagRollout(

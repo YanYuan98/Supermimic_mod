@@ -359,3 +359,83 @@ def test_training_terrain_with_narrow_platforms(tmp_path):
     tr.run()
     assert all(torch.isfinite(p).all() for p in tr.policy.parameters())
     tr.env.close()
+
+
+def test_ground_relative_height_termination(tmp_path):
+    """height_termination = "ground": the simulator's height error is the difference of the heights above the local
+    ground, matches the world model's analytic termination features (``ground_offset``), and a robot standing one stair
+    tread off the reference (same height above its own ground) is not terminated, unlike the reference mode."""
+    from supermimic.envs import SuperMimicEnvCfgArgs, make_env
+    from supermimic.envs.mdp.terminations import root_height_error
+    from supermimic.envs.state_io import StateIO
+    from supermimic.terrain import TerrainInputs
+    from supermimic.world_model.heads import AnalyticHeads, ReferenceFrame
+
+    env = make_env(
+        SuperMimicEnvCfgArgs(
+            npz_files=["data/npz/lafan1/walk1_subject1.npz"], num_envs=16, obs_noise=False, terrain="mixed", terrain_rows=10,
+            terrain_level=9, terrain_stairs_platform=1.5, height_termination="ground", seed=0,
+        ),
+        device=DEV,
+    )
+    try:
+        cmd = env.command_manager.get_term("motion")
+        assert env.termination_manager.get_term_cfg("root_height").params.get("relative_to_ground") is True
+        io = StateIO(env)
+        env.reset()
+        ti = TerrainInputs(cmd.tmap, cmd.fk)
+        worst = 0.0
+        for _ in range(30):
+            env.step((torch.rand(16, 29, device=DEV) - 0.5) * 0.4)
+            s = io.read()
+            ref_root = cmd.root_pos_w - io.origins
+            off = ti.ground_offset(s[:, 0:3], ref_root, io.origins)
+            f = AnalyticHeads.termination_features(s[:, 0:3], s[:, 3:7], ReferenceFrame(None, None, None, None, ref_root, cmd.root_quat_w), off)
+            worst = max(worst, float((f[:, 0] - root_height_error(cmd, True)).abs().max()))
+        assert worst < 2e-5, worst
+        # One tread (0.30 m) along x on a stairs tile: absolute heights differ by a step, heights above ground do not.
+        tm = cmd.tmap
+        lay = tm.layout
+        c = lay.tile_centres(DEV)[9, lay.col_index("stairs_up")]
+        xy0 = torch.stack([c[0] + 1.20, c[1]])[None]
+        xy1 = xy0 + torch.tensor([[0.30, 0.0]], device=DEV)
+        g0, g1 = tm.ground(xy0), tm.ground(xy1)
+        assert float((g1 - g0).abs()) > 0.1  # really a step apart (row 9: 15 cm steps)
+        ref = torch.cat([xy0, g0[:, None] + 0.75], -1)
+        rob = torch.cat([xy1, g1[:, None] + 0.75], -1)
+        q = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=DEV)
+        rf = ReferenceFrame(None, None, None, None, ref, q)
+        h_ref = AnalyticHeads.termination_features(rob, q, rf)[0, 0]
+        h_gnd = AnalyticHeads.termination_features(rob, q, rf, ti.ground_offset(rob, ref, torch.zeros(1, 3, device=DEV)))[0, 0]
+        assert abs(float(h_ref)) > 0.1 and abs(float(h_gnd)) < 1e-4
+    finally:
+        env.close()
+
+
+def test_training_smoke_ground_termination_bf16(tmp_path):
+    """The planned run configuration: ground-relative termination, bf16, depth K=1 without the auxiliary loss, on the
+    1.5 m platform map; the world model's termination features take the ground offset."""
+    from supermimic.config import TrainConfig
+    from supermimic.training.loop import Trainer
+
+    from tests.test_terrain_stack import _tiny
+
+    cfg = _tiny(TrainConfig(), "gnd", tmp_path)
+    cfg.amp = "bf16"
+    cfg.terrain.kind, cfg.terrain.num_rows, cfg.terrain.wm_terrain, cfg.terrain.policy_obs = "mixed", 3, "scan", "depth"
+    cfg.terrain.stairs_platform, cfg.terrain.slope_platform = 1.5, 0.85
+    cfg.terrain.height_termination = "ground"
+    cfg.terrain.depth.slots = 1
+    cfg.policy_trainer.aux_weight = 0.0
+    cfg.schedule.total_iterations = 6
+    cfg.schedule.checkpoint_interval = 6
+    tr = Trainer(cfg)
+    assert tr.wm.cfg.height_termination == "ground" and tr.policy.depth.agg_in.net[0].in_features == 35
+    tr.run()
+    assert all(torch.isfinite(p).all() for m in (tr.policy, tr.critic, tr.wm) for p in m.parameters())
+    tr.env.close()
+    from supermimic.eval.benchmark import terrain_env_kwargs_for_eval
+
+    ck = torch.load(tmp_path / "gnd" / "ckpt_latest.pt", map_location="cpu", weights_only=False)
+    kw = terrain_env_kwargs_for_eval(ck["config"], "mixed")
+    assert kw["height_termination"] == "ground" and kw["terrain_stairs_platform"] == 1.5  # evaluation uses the same test

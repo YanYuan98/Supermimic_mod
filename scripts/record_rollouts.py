@@ -12,8 +12,9 @@ ref_root_quat, ref_joint_pos (depth policies also ``depth``: the newest frame th
 end_frame, first_failure_frame}]}.
 
 Terrain checkpoints run on the plane by default; ``--terrain mixed --terrain-col stairs_up --terrain-row 6``
-centres every clip in that tile of the fixed-seed benchmark map; ``--stairs-platform 1.4`` swaps in the narrow-platform
-stairs variant (evaluation / video only: 16 steps per side on a 12 m tile instead of 6, see ``presets.stairs_layout``). The reference (``ref_root_pos``) is then
+centres every clip in that tile of the fixed-seed benchmark map; ``--stairs-platform 1.5`` swaps in the narrow-platform
+stairs variant (evaluation / video only: 16 steps per side on a 12 m tile instead of 6, see ``presets.stairs_frame``), ``--slope-platform 1.5``
+the slope variant (3 m in training). The reference (``ref_root_pos``) is then
 terrain-lifted (the failure test uses it, as in training) and each clip also stores its episode origin
 ``s{i}_origin`` (world = origin + root_pos); ``metadata_json["terrain"]`` lets render_compare.py rebuild the map.
 
@@ -43,7 +44,7 @@ from supermimic.kinematics.rotations import projected_gravity
 def main(
     ckpt: Path, clips: list[str], out: Path, npz_dir: Path = Path("data/npz/lafan1"), device: str = "cuda:0", height_threshold: float = 0.25, tilt_threshold: float = 0.8,
     terrain: Literal["none", "plane", "mixed"] | None = None, terrain_seed: int = EVAL_TERRAIN_SEED, terrain_col: str = "flat", terrain_row: int = 0,
-    stairs_platform: float | None = None,
+    stairs_platform: float | None = None, slope_platform: float | None = None,
 ) -> None:  # fmt: skip
     from mjlab.envs import ManagerBasedRlEnv
     from mjlab.utils.torch import configure_torch_backends
@@ -64,13 +65,14 @@ def main(
         goal_features=cfg["env"].get("goal_features", "v1"), self_collision=cfg["env"].get("self_collision", True), **tkw,
     )  # fmt: skip
     env_cfg = make_env_cfg(env_args)
-    if stairs_platform is not None:  # evaluation-only stairs variant (the policy never trained on it)
+    if stairs_platform is not None or slope_platform is not None:  # evaluation-only variants (the policy never trained on them)
         from supermimic.terrain import make_terrain_generator_cfg
 
-        assert terrain == "mixed", "--stairs-platform needs --terrain mixed"
+        assert terrain == "mixed", "--stairs-platform / --slope-platform need --terrain mixed"
         env_cfg.scene.terrain.terrain_generator = make_terrain_generator_cfg(
-            "mixed", seed=tkw["terrain_seed"], size=tkw["terrain_size"], num_rows=tkw["terrain_rows"], border=tkw["terrain_border"], stairs_platform=stairs_platform
-        )
+            "mixed", seed=tkw["terrain_seed"], size=tkw["terrain_size"], num_rows=tkw["terrain_rows"], border=tkw["terrain_border"],
+            stairs_platform=stairs_platform, slope_platform=slope_platform,
+        )  # fmt: skip
     for name in ("root_height", "root_tilt"):  # keep running after a failure; it is detected below
         env_cfg.terminations.pop(name)
     configure_torch_backends()
@@ -117,7 +119,10 @@ def main(
                     img = cmd.depth_img[-1].float()
                     rec["depth"].append(torch.where(img[:, 1] > 0.5, (img[:, 0].clamp(-1, 1) + 1) * 127 + 1, torch.zeros_like(img[:, 0])).to(torch.uint8))
                 # Training termination (paper App. A): pelvis height / tilt vs the reference root.
-                dz = (ref.root_pos_w[:, 2] - s[:, 2]).abs()
+                dz = ref.root_pos_w[:, 2] - s[:, 2]
+                if terrain == "mixed" and tkw.get("height_termination") == "ground":  # same test as the env's termination
+                    dz = dz + cmd.tmap.ground(s[:, 0:2] + origin[:, 0:2]) - cmd.tmap.ground(ref.root_pos_w[:, 0:2] + origin[:, 0:2])
+                dz = dz.abs()
                 tilt = (projected_gravity(ref.root_quat_w)[:, 2] - projected_gravity(s[:, 3:7])[:, 2]).abs()
                 bad = ((dz > height_threshold) | (tilt > tilt_threshold)).cpu().numpy() & (failed_at < 0) & (k < lengths)
                 failed_at[bad] = k
@@ -140,6 +145,8 @@ def main(
         meta["terrain"] = {k: tkw[k] for k in ("terrain", "terrain_seed", "terrain_size", "terrain_rows", "terrain_border")} | {"col": terrain_col, "row": terrain_row}
         if stairs_platform is not None:
             meta["terrain"]["stairs_platform"] = stairs_platform
+        if slope_platform is not None:
+            meta["terrain"]["slope_platform"] = slope_platform
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out, metadata_json=json.dumps(meta), **arrays)
     print("saved", out)

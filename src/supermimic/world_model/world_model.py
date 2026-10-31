@@ -42,6 +42,9 @@ class WorldModelCfg:
     term_softness: tuple[float, float] = (0.02, 0.04)  # analytic head: sigmoid widths for height [m] and tilt
     # Terrain condition c_t (set by the trainer from TerrainCfg.wm_terrain): none | foot (28) | scan (187) | both (215).
     terrain: str = "none"
+    # Termination height error (set by the trainer from TerrainCfg.height_termination): "reference" (absolute pelvis
+    # heights vs the terrain-lifted reference) | "ground" (heights above the ground under each pelvis).
+    height_termination: str = "reference"
 
 
 class TerminationHead(nn.Module):
@@ -134,9 +137,15 @@ class WorldModel(nn.Module):
         alive = torch.sigmoid(-(feats[..., 0].abs() - self.cfg.height_threshold) / wz) * torch.sigmoid(-(feats[..., 1].abs() - self.cfg.tilt_threshold) / wt)
         return torch.logit(1.0 - alive, eps=1e-6)
 
-    def termination_logits(self, s_next: torch.Tensor, ref: ReferenceFrame) -> torch.Tensor:
+    def ground_offset(self, root_pos: torch.Tensor, ref_root_pos: torch.Tensor, origin: torch.Tensor | None, grid: HeightGrid | None = None) -> torch.Tensor | None:
+        """Ground-relative termination offset (``TerrainInputs.ground_offset``), or None (reference mode / no terrain)."""
+        if getattr(self.cfg, "height_termination", "reference") != "ground" or self.terrain is None or origin is None:
+            return None
+        return self.terrain.ground_offset(root_pos, ref_root_pos, origin, grid)
+
+    def termination_logits(self, s_next: torch.Tensor, ref: ReferenceFrame, ground_offset: torch.Tensor | None = None) -> torch.Tensor:
         # The pelvis is the free-joint body, so its pose is the state's root pose: no FK needed.
-        feats = self.heads.termination_features(s_next[..., 0:3], s_next[..., 3:7], ref)
+        feats = self.heads.termination_features(s_next[..., 0:3], s_next[..., 3:7], ref, ground_offset)
         return self._term_logits_from_features(feats)
 
     # ------------------------------------------------------------------ Eq. 1
@@ -153,7 +162,8 @@ class WorldModel(nn.Module):
             s = self.step_at(s, a_exec[j], xi, origin, grid)
             e = self.spec.error_vector(s, states[j + 1])
             sq = e * e
-            feats = self.heads.termination_features(s[..., 0:3], s[..., 3:7], ReferenceFrame(None, None, None, None, ref_root_pos[j], ref_root_quat[j]))
+            off = self.ground_offset(s[..., 0:3], ref_root_pos[j], origin, grid)
+            feats = self.heads.termination_features(s[..., 0:3], s[..., 3:7], ReferenceFrame(None, None, None, None, ref_root_pos[j], ref_root_quat[j]), off)
             logits = self._term_logits_from_features(feats)
             total_state = total_state + sq.sum(-1).mean()
             total_term = total_term + F.binary_cross_entropy_with_logits(logits, done[j])
@@ -195,7 +205,8 @@ class WorldModel(nn.Module):
         for j in range(k):
             s = self.step_at(s, a_exec[j], xi, origin, grid)
             err.append(self.spec.normalized_sq_error(s, states[j + 1]))
-            feats = self.heads.termination_features(s[..., 0:3], s[..., 3:7], ReferenceFrame(None, None, None, None, ref_root_pos[j], ref_root_quat[j]))
+            off = self.ground_offset(s[..., 0:3], ref_root_pos[j], origin, grid)
+            feats = self.heads.termination_features(s[..., 0:3], s[..., 3:7], ReferenceFrame(None, None, None, None, ref_root_pos[j], ref_root_quat[j]), off)
             logits.append(self._term_logits_from_features(feats))
         return torch.stack(err), torch.stack(logits)
 
