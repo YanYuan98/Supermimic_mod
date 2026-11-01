@@ -108,7 +108,10 @@ def main(
                 ref = lib.ref(fr)
                 if terrain == "mixed":  # terrain-lifted reference, as the training termination sees it
                     ref.root_pos_w = ref.root_pos_w.clone()
-                    ref.root_pos_w[:, 2] += reference_lift(lib, fr, origin, cmd.tmap)
+                    if tkw.get("reference_lift") == "robot":  # lifted by the ground under the robot pelvis
+                        ref.root_pos_w[:, 2] += cmd.tmap.ground(s[:, 0:2] + origin[:, 0:2])
+                    else:
+                        ref.root_pos_w[:, 2] += reference_lift(lib, fr, origin, cmd.tmap)
                 rec["root_pos"].append(s[:, 0:3])
                 rec["root_quat"].append(s[:, 3:7])
                 rec["joint_pos"].append(s[:, 7:36])

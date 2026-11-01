@@ -214,16 +214,28 @@ class ImagHeads:
         return self._terrain_fn(states, origin, grid)
 
     def _heads(self, states, actions, prev_actions, ref_body_pos, ref_body_quat, ref_body_lin, ref_body_ang, ref_root_pos, ref_root_quat, ref_joint_pos, term_offset=None):
-        """states (H+1, n, 71); actions / prev_actions (H, n, 29); reference tensors for frames 0..H; ``term_offset``
-        (H, n) ground-relative termination offset of s_1..s_H (``height_termination = "ground"``) or None."""
+        """states (H+1, n, 71); actions / prev_actions (H, n, 29); reference tensors for frames 0..H; ``term_offset``:
+        None, (H, n) ground-relative termination offset of s_1..s_H (``height_termination = "ground"``) or (H+1, n) ground
+        under s_0..s_H (``reference_lift = "robot"``, unlifted references)."""
         H1, n = states.shape[:2]
         H = H1 - 1
         heads = self.wm.heads
         flat = states.reshape(H1 * n, -1)
         bodies = heads.robot_bodies(flat)
+        # reference_lift = "robot": ``term_offset`` (H+1, n) is the ground under each s_t; frame t is lifted by the ground
+        # under s_t for the critic features and under s_{t+1} for the reward / termination of reaching s_{t+1}.
+        robot_lift = term_offset is not None and term_offset.shape[0] == H1
+        tgt_body, tgt_root = ref_body_pos[: H * n], ref_root_pos[: H * n]
+        if robot_lift:
+            z_cur, z_next = term_offset.reshape(-1), term_offset[1:].reshape(-1)
+            ref_body_pos = ref_body_pos + torch.nn.functional.pad(z_cur[:, None, None], (2, 0))
+            ref_root_pos = ref_root_pos + torch.nn.functional.pad(z_cur[:, None], (2, 0))
+            tgt_body = tgt_body + torch.nn.functional.pad(z_next[:, None, None], (2, 0))
+            tgt_root = tgt_root + torch.nn.functional.pad(z_next[:, None], (2, 0))
+            term_offset = None
         ref = ReferenceFrame(ref_body_pos, ref_body_quat, ref_body_lin, ref_body_ang, ref_root_pos, ref_root_quat, ref_joint_pos)
         # Reward r_{t+1} of reaching s_{t+1} under target frame t (frames 0..H-1, states 1..H).
-        tgt = ReferenceFrame(*(x[: H * n] for x in (ref_body_pos, ref_body_quat, ref_body_lin, ref_body_ang, ref_root_pos, ref_root_quat, ref_joint_pos)))
+        tgt = ReferenceFrame(tgt_body, ref_body_quat[: H * n], ref_body_lin[: H * n], ref_body_ang[: H * n], tgt_root, ref_root_quat[: H * n], ref_joint_pos[: H * n])
         nxt = {k: v[n:] for k, v in bodies.items()}
         terms = heads.reward(flat[n:], actions.reshape(H * n, -1), prev_actions.reshape(H * n, -1), tgt, nxt)
         term_vec = torch.stack([terms[k].reshape(H, n) for k in REWARD_TERM_NAMES], dim=0)  # (8, H, n)

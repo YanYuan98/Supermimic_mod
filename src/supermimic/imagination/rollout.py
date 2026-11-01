@@ -59,10 +59,11 @@ def imagine(
     last = lib.last_frame_of(start.frame)
     frames = torch.minimum(start.frame[None, :] + torch.arange(H + 1, device=device)[:, None], last[None, :])  # (H+1, n)
     flat_frames = frames.reshape(-1)
-    if terrain is None:
+    robot_lift = terrain is not None and getattr(step_fn.wm.cfg, "reference_lift", "reference") == "robot"
+    grid = None if terrain is None else terrain.grid
+    if terrain is None or robot_lift:  # robot lift: lifted per state after the rollout (ImagHeads)
         ref = reference_at(lib, flat_frames)
     else:
-        grid = terrain.grid
         ref = terrain.reference(lib, flat_frames, start.origin[None].expand(H + 1, n, 3).reshape(-1, 3), grid)
     goal_ref = lib.goal_window(flat_frames, future_frames, goal_features).reshape(H + 1, n, -1)
     anchor_pos = ref.body_pos_w[:, ai].reshape(H + 1, n, 3)
@@ -124,7 +125,9 @@ def imagine(
     crit_terr = ground_z = term_offset = None
     if terrain is not None:
         crit_terr, ground_z = heads_fn.critic_terrain(states, start.origin, grid)
-        if getattr(step_fn.wm.cfg, "height_termination", "reference") == "ground":
+        if robot_lift:
+            term_offset = ground_z  # (H+1, n): lift of frame t under s_t (critic) / under s_{t+1} (reward, termination)
+        elif getattr(step_fn.wm.cfg, "height_termination", "reference") == "ground":
             # s_{t+1} is judged against target frame t: ground under s_1..s_H minus ground under reference roots 0..H-1.
             ref_xy = ref.root_pos_w[: H * n].reshape(H, n, 3)
             term_offset = terrain.ground_offset(states[1:, :, 0:3], ref_xy, start.origin[None], grid)

@@ -343,6 +343,16 @@ class MultiClipMotionCommand(CommandTerm):
 
             self._dz[:, 2] = reference_lift(self.library, self.frame, self._env.scene.env_origins, self.tmap)
 
+    def _lift(self) -> torch.Tensor:
+        """(N, 3) [0, 0, lift] added to the reference positions: the ground under the reference pelvis (``reference_lift
+        = "reference"``, cached per frame) or under the robot pelvis (``"robot"``: the reference follows the terrain the
+        robot is actually on, so accumulated horizontal drift does not change the height targets)."""
+        if self.cfg.reference_lift == "robot":
+            dz = torch.zeros_like(self._dz)
+            dz[:, 2] = self.tmap.ground(self.robot_root_pos_w[:, 0:2])
+            return dz
+        return self._dz
+
     @property
     def command(self) -> torch.Tensor:
         return torch.cat([self.joint_pos, self.joint_vel], dim=1)
@@ -362,7 +372,7 @@ class MultiClipMotionCommand(CommandTerm):
     @property
     def body_pos_w(self) -> torch.Tensor:
         p = self._bodies.pos_w + self._env.scene.env_origins[:, None, :]
-        return p if self._dz is None else p + self._dz[:, None, :]
+        return p if self._dz is None else p + self._lift()[:, None, :]
 
     @property
     def body_quat_w(self) -> torch.Tensor:
@@ -379,7 +389,7 @@ class MultiClipMotionCommand(CommandTerm):
     @property
     def anchor_pos_w(self) -> torch.Tensor:
         p = self._bodies.pos_w[:, self.motion_anchor_body_index] + self._env.scene.env_origins
-        return p if self._dz is None else p + self._dz
+        return p if self._dz is None else p + self._lift()
 
     @property
     def anchor_quat_w(self) -> torch.Tensor:
@@ -388,7 +398,7 @@ class MultiClipMotionCommand(CommandTerm):
     @property
     def root_pos_w(self) -> torch.Tensor:
         p = self._ref.root_pos_w + self._env.scene.env_origins
-        return p if self._dz is None else p + self._dz
+        return p if self._dz is None else p + self._lift()
 
     @property
     def root_quat_w(self) -> torch.Tensor:
@@ -715,6 +725,7 @@ class MultiClipMotionCommandCfg(CommandTermCfg):
     terrain_map: TerrainMapCfg = field(default_factory=TerrainMapCfg)
     scan_noise: ScanNoiseCfg = field(default_factory=ScanNoiseCfg)  # policy scan corruption (disabled for evaluation)
     depth: DepthCfg | None = None  # rendered policy depth frames (terrain/depth.py); None = no camera
+    reference_lift: str = "reference"  # mixed: lift the reference by the ground under the "reference" | "robot" pelvis
     spawn_margin: float = 0.5  # m between the reference path bbox and the tile edge
     spawn_horizon: int = 32  # the spawn bbox covers one episode + this many frames (imagination horizon)
     max_step_reward: float = 0.1  # normalisation of the terrain-episode returns (curriculum)

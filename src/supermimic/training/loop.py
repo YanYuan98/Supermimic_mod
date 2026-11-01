@@ -54,6 +54,9 @@ class Trainer:
         cfg.critic.terrain_dim = CRITIC_TERRAIN_DIM if terrain_on else 0
         cfg.world_model.terrain = tcfg.wm_terrain if terrain_on else "none"
         cfg.world_model.height_termination = tcfg.height_termination if terrain_on else "reference"
+        cfg.world_model.reference_lift = tcfg.reference_lift if terrain_on else "reference"
+        if tcfg.reference_lift == "robot" and tcfg.height_termination != "reference":
+            raise ValueError("reference_lift='robot' already makes the height termination ground-relative: use height_termination='reference'")
         from supermimic.world_model import dynamics
 
         dynamics.AMP_DTYPE = {"none": None, "bf16": torch.bfloat16}[cfg.amp]

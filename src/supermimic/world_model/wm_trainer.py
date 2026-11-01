@@ -56,7 +56,7 @@ class WorldModelTrainer:
         k, n = w.frame.shape
         r = self.lib.ref(w.frame.reshape(-1))
         root_pos = r.root_pos_w.reshape(k, n, 3)
-        if self.terrain is not None and not self.terrain.is_plane:
+        if self.terrain is not None and not self.terrain.is_plane and getattr(self.wm.cfg, "reference_lift", "reference") != "robot":
             lift = self.terrain.root_lift(self.lib, w.frame, w.origin[None], self.terrain.grid)  # (k, n)
             root_pos = root_pos + torch.nn.functional.pad(lift[..., None], (2, 0))
         return root_pos, r.root_quat_w.reshape(k, n, 4)

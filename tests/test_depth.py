@@ -439,3 +439,66 @@ def test_training_smoke_ground_termination_bf16(tmp_path):
     ck = torch.load(tmp_path / "gnd" / "ckpt_latest.pt", map_location="cpu", weights_only=False)
     kw = terrain_env_kwargs_for_eval(ck["config"], "mixed")
     assert kw["height_termination"] == "ground" and kw["terrain_stairs_platform"] == 1.5  # evaluation uses the same test
+
+
+def test_reference_lift_under_robot(tmp_path):
+    """reference_lift = "robot": the simulator's reference positions are lifted by the ground under the robot pelvis, the
+    imagination heads lift unlifted references by the ground under each predicted state (same reward / termination as the
+    simulator would give for that state), and a tiny training run works."""
+    from supermimic.config import TrainConfig
+    from supermimic.training.loop import Trainer
+    from supermimic.world_model.wm_trainer import reference_at
+
+    from tests.test_terrain_stack import _tiny
+
+    cfg = _tiny(TrainConfig(), "rlift", tmp_path)
+    cfg.amp = "bf16"
+    cfg.terrain.kind, cfg.terrain.num_rows, cfg.terrain.wm_terrain, cfg.terrain.policy_obs = "mixed", 4, "scan", "depth"
+    cfg.terrain.stairs_platform, cfg.terrain.slope_platform, cfg.terrain.reference_lift = 1.5, 0.85, "robot"
+    cfg.terrain.curriculum.start_level = 3
+    cfg.terrain.depth.slots = 1
+    cfg.policy_trainer.aux_weight = 0.0
+    cfg.schedule.total_iterations = 6
+    cfg.schedule.checkpoint_interval = 6
+    tr = Trainer(cfg)
+    cmd, env = tr.command, tr.env
+    assert tr.wm.cfg.reference_lift == "robot"
+    tr._obs, _ = env.reset()
+    tr._finished_returns, tr._finished_lens = [], []
+    for _ in range(20):
+        tr._env_step()
+    g = cmd.tmap.ground(cmd.robot_root_pos_w[:, 0:2])
+    lib_z = cmd.library.ref(cmd.frame).root_pos_w[:, 2]
+    torch.testing.assert_close(cmd.root_pos_w[:, 2], lib_z + g, atol=1e-5, rtol=0)
+    assert float(g.abs().max()) > 0.05  # really on uneven ground
+    # Imagination heads: unlifted references + per-state ground == the simulator's lifted reference for that state.
+    from supermimic.envs.state_io import StateIO
+
+    s = StateIO(env).read()
+    o = env.scene.env_origins
+    gz = tr.terrain.ground_z(s, o)
+    ref = reference_at(cmd.library, cmd.frame)
+    torch.testing.assert_close(ref.root_pos_w[:, 2] + gz, cmd.root_pos_w[:, 2], atol=2e-3, rtol=0)  # robot.data vs qpos
+    # ImagHeads with the per-state lift (H = 1: s_0 = s_1 = s) == heads.reward / termination on the lifted reference.
+    from supermimic.imagination.compiled import ImagHeads
+    from supermimic.world_model.heads import ReferenceFrame
+
+    n = s.shape[0]
+    two = lambda x: torch.cat([x, x])  # noqa: E731
+    ref2 = ReferenceFrame(*(two(getattr(ref, f)) for f in ("body_pos_w", "body_quat_w", "body_lin_vel_w", "body_ang_vel_w", "root_pos_w", "root_quat_w", "joint_pos")))
+    a = env.action_manager.action
+    hf = ImagHeads(tr.wm, compile_mode=None, terrain=tr.terrain)
+    r, _, logits, _ = hf(torch.stack([s, s]), a[None], env.action_manager.prev_action[None], ref2, torch.stack([gz, gz]))
+    dz = torch.nn.functional.pad(gz[:, None], (2, 0))
+    lifted = ReferenceFrame(ref.body_pos_w + dz[:, None], ref.body_quat_w, ref.body_lin_vel_w, ref.body_ang_vel_w, ref.root_pos_w + dz, ref.root_quat_w, ref.joint_pos)
+    want = tr.wm.heads.reward(s, a, env.action_manager.prev_action, lifted)["total"]
+    torch.testing.assert_close(r[0], want, atol=1e-5, rtol=0)
+    torch.testing.assert_close(logits[0], tr.wm.termination_logits(s, lifted), atol=1e-4, rtol=0)
+    del n
+    tr.run()
+    assert all(torch.isfinite(p).all() for m in (tr.policy, tr.critic, tr.wm) for p in m.parameters())
+    tr.env.close()
+    cfg2 = _tiny(TrainConfig(), "bad", tmp_path)
+    cfg2.terrain.kind, cfg2.terrain.reference_lift, cfg2.terrain.height_termination = "plane", "robot", "ground"
+    with pytest.raises(ValueError):
+        Trainer(cfg2)

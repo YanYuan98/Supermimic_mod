@@ -45,6 +45,7 @@ class WorldModelCfg:
     # Termination height error (set by the trainer from TerrainCfg.height_termination): "reference" (absolute pelvis
     # heights vs the terrain-lifted reference) | "ground" (heights above the ground under each pelvis).
     height_termination: str = "reference"
+    reference_lift: str = "reference"  # "robot": references come unlifted, the ground under the predicted pelvis is added
 
 
 class TerminationHead(nn.Module):
@@ -138,8 +139,13 @@ class WorldModel(nn.Module):
         return torch.logit(1.0 - alive, eps=1e-6)
 
     def ground_offset(self, root_pos: torch.Tensor, ref_root_pos: torch.Tensor, origin: torch.Tensor | None, grid: HeightGrid | None = None) -> torch.Tensor | None:
-        """Ground-relative termination offset (``TerrainInputs.ground_offset``), or None (reference mode / no terrain)."""
-        if getattr(self.cfg, "height_termination", "reference") != "ground" or self.terrain is None or origin is None:
+        """Termination height offset, or None: ``height_termination = "ground"``: ground under the pelvis minus ground under
+        the (lifted) reference pelvis; ``reference_lift = "robot"``: ground under the pelvis (the reference is unlifted)."""
+        if self.terrain is None or origin is None:
+            return None
+        if getattr(self.cfg, "reference_lift", "reference") == "robot":
+            return self.terrain.ground_z(root_pos, origin, grid).detach()
+        if getattr(self.cfg, "height_termination", "reference") != "ground":
             return None
         return self.terrain.ground_offset(root_pos, ref_root_pos, origin, grid)
 

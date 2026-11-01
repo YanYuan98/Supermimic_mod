@@ -108,6 +108,11 @@ class TerrainCfg:
     # terrain-lifted reference (previous runs); "ground" = heights above the ground under each pelvis, so horizontal
     # drift onto another tread or slope height is not a failure (the global position reward still penalises it).
     height_termination: Literal["reference", "ground"] = "reference"
+    # Terrain lift of the reference (rewards, termination, critic errors; simulator, world model and imagination):
+    # "reference" = ground under the reference pelvis (previous runs); "robot" = ground under the robot pelvis, so
+    # targets follow the terrain the robot is on after horizontal drift (the termination then already compares heights
+    # above the local ground: use it with height_termination = "reference").
+    reference_lift: Literal["reference", "robot"] = "reference"
     depth: DepthCfg = field(default_factory=DepthCfg)
     grad: bool = False  # True: let gradients flow through the terrain slope (bilinear weights); default detached
     curriculum: TerrainCurriculumCfg = field(default_factory=TerrainCurriculumCfg)
@@ -167,6 +172,8 @@ def terrain_env_kwargs(tcfg) -> dict:
     )
     if t.get("height_termination", "reference") != "reference":
         out["height_termination"] = t["height_termination"]
+    if t.get("reference_lift", "reference") != "reference":
+        out["reference_lift"] = t["reference_lift"]
     if t.get("policy_obs", "scan") == "depth":
         out["depth"] = DepthCfg(**t["depth"])
     if t["kind"] == "mixed":

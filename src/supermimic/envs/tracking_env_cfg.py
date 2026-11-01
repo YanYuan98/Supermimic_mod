@@ -96,6 +96,7 @@ class SuperMimicEnvCfgArgs:
     seed: int | None = 0
     root_height_threshold: float = 0.25
     height_termination: str = "reference"  # "reference" | "ground" (terrain only: heights above the local ground)
+    reference_lift: str = "reference"  # mixed: reference lifted by the ground under the "reference" | "robot" pelvis
     root_tilt_threshold: float = 0.8
     joint_limit_weight: float = -2.0
     bin_frames: int = 50
@@ -173,6 +174,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         terrain_kwargs = dict(
             terrain=a.terrain,
             terrain_level=a.terrain_level,
+            reference_lift=a.reference_lift,
             terrain_map=TerrainMapCfg(res=a.terrain_res, cache_dir=a.terrain_cache_dir),
             scan_noise=a.scan_noise if (a.obs_noise or a.scan_noise_always) else ScanNoiseCfg(enabled=False),
             depth=None if a.depth is None else (a.depth if (a.obs_noise or a.scan_noise_always) else dataclasses.replace(a.depth, noise=False)),
