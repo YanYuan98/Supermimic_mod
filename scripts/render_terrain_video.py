@@ -60,12 +60,18 @@ def step_height(row: int, rows: int = 10) -> float:
     return 0.02 + 0.13 * row / (rows - 1)
 
 
-def style_terrain(model, terrain: dict, native_colors: bool = False) -> None:
+def style_terrain(model, terrain: dict, native_colors: bool = False, terrain_rgba: tuple | None = None) -> None:
     """Neutral terrain look for the video: stair / box tops alternate two greys per step level (step edges readable),
     height fields get the checker material of render_compare; near / far planes in metres (the large map inflates
     ``stat.extent``, which put the default near plane at 2.6 m and clipped the stairs in front of the camera)."""
     model.vis.map.znear = 0.05 / model.stat.extent
     model.vis.map.zfar = 120.0 / model.stat.extent
+    if terrain_rgba is not None:  # spec "terrain_rgba": one plain colour for every terrain geom, no texture, default lighting
+        tb = np.bincount(model.geom_bodyid).argmax()
+        for g in np.flatnonzero(model.geom_bodyid == tb):
+            model.geom_matid[g] = -1
+            model.geom_rgba[g] = terrain_rgba
+        return
     if native_colors:  # spec "native_colors": keep the terrain generator's own colours and the default lighting
         return
     tb = np.bincount(model.geom_bodyid).argmax()  # the terrain body holds most geoms
@@ -402,7 +408,8 @@ def main():
         if terrain:
             break
     model = rc.build_model(terrain)
-    style_terrain(model, terrain, native_colors=bool(spec.get("native_colors", False)))
+    rgba = spec.get("terrain_rgba")
+    style_terrain(model, terrain, native_colors=bool(spec.get("native_colors", False)), terrain_rgba=None if rgba is None else tuple(rgba))
     ground = Ground(terrain)
     body_ids = np.array([mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, b) for b in rc.TRACKED])
     robot, ghost = mujoco.MjData(model), mujoco.MjData(model)
