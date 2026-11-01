@@ -50,7 +50,7 @@ def build_model(terrain: dict | None = None):
 
         from supermimic.terrain import make_terrain_generator_cfg
 
-        gen = make_terrain_generator_cfg(terrain["terrain"], seed=terrain["terrain_seed"], size=terrain["terrain_size"], num_rows=terrain["terrain_rows"], border=terrain["terrain_border"], stairs_platform=terrain.get("stairs_platform"))
+        gen = make_terrain_generator_cfg(terrain["terrain"], seed=terrain["terrain_seed"], size=terrain["terrain_size"], num_rows=terrain["terrain_rows"], border=terrain["terrain_border"], stairs_platform=terrain.get("stairs_platform"), slope_platform=terrain.get("slope_platform"))
         TerrainGenerator(gen).compile(spec)
     spec.add_texture(name="grid", type=mujoco.mjtTexture.mjTEXTURE_2D, builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER, rgb1=[0.82, 0.84, 0.86],
                      rgb2=[0.70, 0.72, 0.75], width=512, height=512, mark=mujoco.mjtMark.mjMARK_EDGE, markrgb=[0.55, 0.57, 0.6])  # fmt: skip

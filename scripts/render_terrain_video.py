@@ -12,7 +12,7 @@ Spec (json): {"output", "font_dir", "items": [...]}, each item one of
   {"type": "side", "duration_s", "panels": [SEG x 2]}   (two synchronised 960x1080 panels, e.g. one clip on two terrains)
 with SEG = {"rollout", "clip", "start_s", "azimuth" (default 135), "distance" (default 3.0), "elevation" (default -18)}.
 Rollouts of one video must share the map (``metadata_json["terrain"]`` up to col / row), e.g. the narrow-platform
-stairs variant (``record_rollouts.py --stairs-platform``) in its own video. On stairs, the overlay also counts the
+stairs / slope variants (``record_rollouts.py --stairs-platform / --slope-platform``) in their own video. On stairs, the overlay also counts the
 stair levels the feet stood on (``foot_levels``) and the pelvis level changes (``stair_crossings``).
 
   MUJOCO_GL=egl python scripts/render_terrain_video.py --spec spec.json --only 3   # one item -> <out>_parts/03.mp4
@@ -38,9 +38,9 @@ TERRAIN_ZH = {"flat": "平地", "stairs_up": "上台阶（凹坑，中心低）"
               "slope_down": "下坡（凸台）", "rough": "随机粗糙", "wave": "波浪", "perlin": "Perlin 噪声", "blocks": "离散方块"}  # fmt: skip
 
 
-def terrain_param(col: str, row: int, rows: int = 10, stairs_platform: float | None = None) -> str:
+def terrain_param(col: str, row: int, rows: int = 10, stairs_platform: float | None = None, slope_platform: float | None = None) -> str:
     """Key parameter of a tile of the mixed grid (supermimic.terrain.presets.mixed_sub_terrains, d = row / (rows - 1));
-    ``stairs_platform``: the narrow-platform stairs variant (steps per side / platform from presets.stairs_layout)."""
+    ``stairs_platform`` / ``slope_platform``: the narrow-platform variants (stairs: steps per side from presets.stairs_layout)."""
     d = row / (rows - 1)
     if col in ("stairs_up", "stairs_down"):
         if stairs_platform is None:
@@ -50,7 +50,8 @@ def terrain_param(col: str, row: int, rows: int = 10, stairs_platform: float | N
         n, plat = stairs_layout(platform_width=stairs_platform)
         return f"级高 {100 * step_height(row, rows):.1f} cm · 每侧 {n} 级 · 踏面 30 cm · 中央平台 {plat:.1f} m × {plat:.1f} m · 总高 {(n + 1) * step_height(row, rows):.2f} m"
     if col in ("slope_up", "slope_down"):
-        return f"最大坡度 {36 * d:.0f}%（{math.degrees(math.atan(0.36 * d)):.0f}°）"
+        s = f"最大坡度 {36 * d:.0f}%（{math.degrees(math.atan(0.36 * d)):.0f}°）"
+        return s if slope_platform is None else f"{s} · 中央平台 {slope_platform:.1f} m"
     return {"flat": "无起伏（对照）", "rough": f"随机起伏 0–{6 * d:.1f} cm", "wave": f"振幅 ±{15 * d:.1f} cm",
             "perlin": f"高度 0–{20 * d:.1f} cm", "blocks": f"块高 ±{2 + 10 * d:.1f} cm"}[col]  # fmt: skip
 
@@ -59,10 +60,14 @@ def step_height(row: int, rows: int = 10) -> float:
     return 0.02 + 0.13 * row / (rows - 1)
 
 
-def style_terrain(model, terrain: dict) -> None:
+def style_terrain(model, terrain: dict, native_colors: bool = False) -> None:
     """Neutral terrain look for the video: stair / box tops alternate two greys per step level (step edges readable),
     height fields get the checker material of render_compare; near / far planes in metres (the large map inflates
     ``stat.extent``, which put the default near plane at 2.6 m and clipped the stairs in front of the camera)."""
+    model.vis.map.znear = 0.05 / model.stat.extent
+    model.vis.map.zfar = 120.0 / model.stat.extent
+    if native_colors:  # spec "native_colors": keep the terrain generator's own colours and the default lighting
+        return
     tb = np.bincount(model.geom_bodyid).argmax()  # the terrain body holds most geoms
     grid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MATERIAL, "grid")
     size, rows = terrain["terrain_size"], terrain["terrain_rows"]
@@ -81,8 +86,6 @@ def style_terrain(model, terrain: dict) -> None:
             model.geom_matid[g] = -1
             model.geom_rgba[g] = (0.88, 0.87, 0.84, 1.0) if lv % 2 else (0.68, 0.70, 0.74, 1.0)
     model.vis.headlight.ambient[:] = 0.45
-    model.vis.map.znear = 0.05 / model.stat.extent
-    model.vis.map.zfar = 120.0 / model.stat.extent
 
 
 class Ground:
@@ -92,7 +95,7 @@ class Ground:
         from supermimic.terrain import make_terrain_generator_cfg
         from supermimic.terrain.presets import compile_terrain
 
-        gen = make_terrain_generator_cfg(terrain["terrain"], seed=terrain["terrain_seed"], size=terrain["terrain_size"], num_rows=terrain["terrain_rows"], border=terrain["terrain_border"], stairs_platform=terrain.get("stairs_platform"))
+        gen = make_terrain_generator_cfg(terrain["terrain"], seed=terrain["terrain_seed"], size=terrain["terrain_size"], num_rows=terrain["terrain_rows"], border=terrain["terrain_border"], stairs_platform=terrain.get("stairs_platform"), slope_platform=terrain.get("slope_platform"))
         self.m, _ = compile_terrain(gen)
         self.d = mujoco.MjData(self.m)
         mujoco.mj_forward(self.m, self.d)
@@ -173,6 +176,7 @@ class Seg:
         self.cfg, self.clip = cfg, cfg["clip"]
         self.col, self.row = meta["terrain"]["col"], meta["terrain"]["row"]
         self.platform = meta["terrain"].get("stairs_platform")
+        self.slope_platform = meta["terrain"].get("slope_platform")
         self.t = rc.Track(roll, i, world=True)
         self.depth = roll[f"s{i}_depth"] if f"s{i}_depth" in roll.files else None  # policy depth frames (depth policies)
         self.lo = int(round(cfg["start_s"] / DT))
@@ -196,12 +200,12 @@ class Seg:
 
     @property
     def param(self) -> str:
-        return terrain_param(self.col, self.row, stairs_platform=self.platform)
+        return terrain_param(self.col, self.row, stairs_platform=self.platform, slope_platform=self.slope_platform)
 
     def summary(self) -> dict:
         t = self.t
         lv = None if self.levels is None else sorted({int(v) for v in self.levels[0][self.lo : self.hi].ravel() if v < 10**6})
-        return {"clip": self.clip, "terrain": self.col, "row": self.row, "stairs_platform": self.platform, "param": self.param, "window_s": [round(self.lo * DT, 2), round(self.hi * DT, 2)],
+        return {"clip": self.clip, "terrain": self.col, "row": self.row, "stairs_platform": self.platform, "slope_platform": self.slope_platform, "param": self.param, "window_s": [round(self.lo * DT, 2), round(self.hi * DT, 2)],
                 "clip_len_s": round(t.n * DT, 2), "outcome": "SUCCESS" if self.fail is None else "FAIL", "first_failure_s": None if self.fail is None else round(self.fail * DT, 2), "fail_cause": self.cause, "physical_fall": self.fell,
                 "fail_in_window": self.fail is not None and self.lo <= self.fail < self.hi, "keypoint_err_mm_window_mean": round(float(np.nanmean(t.err_mm[self.lo:self.hi])), 1),
                 "stair_crossings_window": None if self.cross is None else int(self.cross[self.hi - 1] - self.cross[self.lo]),
@@ -221,7 +225,7 @@ def draw_overlay(canvas: Image.Image, x0: int, y0: int, pw: int, ph: int, seg: S
     pad = int(16 * k) + 4
     # Top-left: terrain, row, parameter, clip and time.
     param = seg.param
-    if seg.platform is not None and " · 中央平台" in param:  # two lines for the longer narrow-stairs parameter
+    if " · 中央平台" in param:  # two lines for the longer narrow-platform parameter
         a, b = param.split(" · 中央平台", 1)
         param_lines = [(a, fonts["body"]), ("中央平台" + b, fonts["body"])]
     else:
@@ -398,7 +402,7 @@ def main():
         if terrain:
             break
     model = rc.build_model(terrain)
-    style_terrain(model, terrain)
+    style_terrain(model, terrain, native_colors=bool(spec.get("native_colors", False)))
     ground = Ground(terrain)
     body_ids = np.array([mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, b) for b in rc.TRACKED])
     robot, ghost = mujoco.MjData(model), mujoco.MjData(model)
