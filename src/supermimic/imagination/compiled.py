@@ -84,9 +84,10 @@ class ImagStep:
 class ImagHeads:
     """Batched reward / termination / critic features over a whole rollout."""
 
-    def __init__(self, wm: WorldModel, critic_features: bool = True, compile_mode: str | None = None):
+    def __init__(self, wm: WorldModel, critic_features: bool | str = True, compile_mode: str | None = None):
         self.wm = wm
-        self.critic_features = critic_features
+        # "v4" (84-d torso-anchored errors), "vibed" (80-d pelvis-anchored) or "root" (4-d root errors).
+        self.critic_features = {True: "v4", False: "root"}.get(critic_features, critic_features)
         self._fn = _compile(self._heads, compile_mode)
 
     def _heads(self, states, actions, prev_actions, ref_body_pos, ref_body_quat, ref_body_lin, ref_body_ang, ref_root_pos, ref_root_quat, ref_joint_pos):
@@ -104,8 +105,10 @@ class ImagHeads:
         term_vec = torch.stack([terms[k].reshape(H, n) for k in REWARD_TERM_NAMES], dim=0)  # (8, H, n)
         logits = self.wm.termination_logits(flat[n:], tgt).reshape(H, n)
         # Critic features of s_t against target frame t (t = 0..H).
-        if self.critic_features:
+        if self.critic_features == "v4":
             crit = heads.critic_error_features(flat, ref, bodies)
+        elif self.critic_features == "vibed":
+            crit = heads.critic_error_features_vibed(flat, ref, bodies)
         else:
             crit = heads.root_error_features(flat, ref)
         return terms["total"].reshape(H, n), term_vec, logits, crit.reshape(H1, n, -1)

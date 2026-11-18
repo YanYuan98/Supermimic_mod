@@ -133,6 +133,19 @@ class StateSpec:
         err = torch.cat([p1 - p2, rot_err, v1 - v2, w1 - w2, qj1 - qj2, qd1 - qd2], dim=-1)
         return err / self.err_scale
 
+    def local_error(self, s_pred: torch.Tensor, s_true: torch.Tensor) -> torch.Tensor:
+        """Frame-local error (…, 70) as in supermimic_vibed's ``state_error``: [position in the heading
+        frame of ``s_true``, rotation vector (body), linear velocity in the body frame of ``s_true``,
+        body angular velocity, joint positions, joint velocities]. ``local_error(s1, s0)`` is the
+        one-step increment from ``s0`` to ``s1`` in the same layout."""
+        p1, q1, qj1, v1, w1, qd1 = self.split(s_pred)
+        p2, q2, qj2, v2, w2, qd2 = self.split(s_true)
+        q1, q2 = quat_normalize(q1), quat_normalize(q2)
+        rot_err = rotvec_from_quat(quat_mul(quat_apply_inverse_quat(q2), q1))
+        dp = quat_apply_inverse(heading_quat(q2), p1 - p2)
+        dv = quat_apply_inverse(q2, v1 - v2)
+        return torch.cat([dp, rot_err, dv, w1 - w2, qj1 - qj2, qd1 - qd2], dim=-1)
+
     def normalized_sq_error(self, s_pred: torch.Tensor, s_true: torch.Tensor) -> torch.Tensor:
         """Mean over dims of the squared normalised error (the reported 'prediction error')."""
         e = self.error_vector(s_pred, s_true)

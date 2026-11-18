@@ -11,7 +11,7 @@ from supermimic.envs.mdp.motion_library import MotionLibrary
 from supermimic.imagination.objective import gae_targets, policy_objective
 from supermimic.imagination.rollout import ImagRollout, imagine
 from supermimic.policy.nets import Critic, Policy
-from supermimic.training.distributed import allreduce_grads
+from supermimic.training.distributed import allreduce_buffers, allreduce_grads
 from supermimic.world_model.world_model import WorldModel
 
 
@@ -53,7 +53,7 @@ class PolicyTrainer:
         from supermimic.imagination.compiled import ImagHeads, ImagStep
 
         self.step_fn = ImagStep(wm, policy, lib.default_joint_pos, anchor_obs=cfg.anchor_obs, obs_noise=cfg.obs_noise, compile_mode=cfg.compile)
-        self.heads_fn = ImagHeads(wm, critic_features=critic.err_dim > 4, compile_mode=cfg.compile)
+        self.heads_fn = ImagHeads(wm, critic_features=critic.feature_mode, compile_mode=cfg.compile)
 
     def set_lr(self, lr: float) -> None:
         for g in self.opt.param_groups:
@@ -113,6 +113,9 @@ class PolicyTrainer:
                 feat_d, goals_d, err_d = feat.detach(), goals.detach(), err.detach()
                 H1, n, _ = feat_d.shape
                 xi_rep = xi_norm[None].expand(H1, n, -1)
+                if self.critic.norm is not None:  # v5 C1: running input statistics from the imagined states (vibed)
+                    self.critic.update_norm(feat_d, goals_d, xi_rep, err_d)
+                    allreduce_buffers(self.critic)
                 values = self.critic(feat_d.reshape(H1 * n, -1), goals_d.reshape(H1 * n, -1), xi_rep.reshape(H1 * n, -1), err_d.reshape(H1 * n, -1)).reshape(H1, n)
                 targets = gae_targets(ro.rewards.detach(), ro.dhat[1:].detach(), values, cfg.gamma, cfg.gae_lambda)  # (H, n)
                 X_feat = feat_d[:-1].reshape(-1, feat_d.shape[-1])

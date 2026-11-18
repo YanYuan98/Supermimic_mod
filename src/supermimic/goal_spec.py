@@ -8,7 +8,7 @@ needs state estimation). ``goal_features`` (F6): per-frame features "v1" (68) or
 from __future__ import annotations
 
 ANCHOR_OBS_DIMS = {"none": 0, "ori": 6, "pos_ori": 9}
-GOAL_FEAT_DIMS = {"v1": 68, "traj": 77}
+GOAL_FEAT_DIMS = {"v1": 68, "traj": 77, "vibed": 73}  # "vibed": v5 ablation F1
 
 
 def anchor_mode(value) -> str:

@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from supermimic.world_model.dynamics import MLP, RunningNorm
-from supermimic.world_model.heads import CRITIC_ERR_DIM, OBS_TERMS
+from supermimic.world_model.heads import CRITIC_ERR_DIM, CRITIC_ERR_DIM_VIBED, OBS_TERMS
 
 GOAL_DIM = 680
 LATENT_DIM = 32
@@ -40,6 +40,13 @@ class CriticCfg:
     hidden: tuple[int, ...] = (256, 128)
     # Privileged tracking-error features (IMPROVEMENT_PLAN F5); False = root errors only (4).
     error_features: bool = True
+    # v5 ablation D1: "v4" (torso-anchored, 84) or "vibed" (pelvis-anchored as supermimic_vibed:
+    # joint error 29 + body position error 42 + root position error 3 + relative orientation 6 = 80).
+    features: str = "v4"
+    # v5 ablation C1: "fixed" (per-block fixed scales) or "running" (running mean/std of the whole
+    # input, updated from the imagined critic inputs, as supermimic_vibed); activation "silu" | "elu".
+    input_norm: str = "fixed"
+    activation: str = "silu"
 
 
 def _obs_scale_vector(cfg: PolicyCfg) -> torch.Tensor:
@@ -52,7 +59,10 @@ def _obs_scale_vector(cfg: PolicyCfg) -> torch.Tensor:
 def _goal_scale_vector(cfg: PolicyCfg, goal_dim: int) -> torch.Tensor:
     sizes = (29, 29, 3, 3, 3, 1)
     frame_dim = getattr(cfg, "goal_frame_dim", 68)
-    per_frame = torch.cat([torch.full((n,), 1.0 / s) for n, s in zip(sizes, cfg.goal_term_scale)] + [torch.ones(frame_dim - 68)])
+    if frame_dim == 73:  # v5 "vibed" goal: no v1 block (joint velocities are already scaled by 0.1)
+        per_frame = torch.ones(73)
+    else:
+        per_frame = torch.cat([torch.full((n,), 1.0 / s) for n, s in zip(sizes, cfg.goal_term_scale)] + [torch.ones(frame_dim - 68)])
     k = getattr(cfg, "future_frames", 10)
     extra = goal_dim - k * frame_dim
     if extra < 0:  # configs from before future_frames/goal_frame_dim were stored
@@ -119,9 +129,29 @@ class Critic(nn.Module):
         super().__init__()
         pcfg = pcfg or PolicyCfg()
         goal_dim = goal_dim or pcfg.goal_dim
-        self.err_dim = CRITIC_ERR_DIM if cfg.error_features else 4
-        self.mlp = MLP(feat_dim + goal_dim + xi_dim + self.err_dim, cfg.hidden, 1)
+        features = getattr(cfg, "features", "v4")
+        if features not in ("v4", "vibed"):
+            raise ValueError(f"unknown critic features {features!r}")
+        self.feature_mode = ("vibed" if features == "vibed" else "v4") if cfg.error_features else "root"
+        self.err_dim = {"v4": CRITIC_ERR_DIM, "vibed": CRITIC_ERR_DIM_VIBED, "root": 4}[self.feature_mode]
+        in_dim = feat_dim + goal_dim + xi_dim + self.err_dim
+        self.mlp = MLP(in_dim, cfg.hidden, 1, act=getattr(cfg, "activation", "silu"))
         self.register_buffer("goal_scale", _goal_scale_vector(pcfg, goal_dim))
+        mode = getattr(cfg, "input_norm", "fixed")
+        if mode not in ("fixed", "running"):
+            raise ValueError(f"unknown critic input_norm {mode!r}")
+        self.norm = RunningNorm(in_dim) if mode == "running" else None
+
+    def _inputs(self, feat, goal, xi_norm, err) -> torch.Tensor:
+        if self.norm is not None:
+            return torch.cat([feat, goal, xi_norm, err], dim=-1)
+        return torch.cat([feat, goal * self.goal_scale, xi_norm, err], dim=-1)
+
+    @torch.no_grad()
+    def update_norm(self, feat, goal, xi_norm, err) -> None:
+        if self.norm is not None:
+            self.norm.update(self._inputs(feat, goal, xi_norm, err))
 
     def forward(self, feat: torch.Tensor, goal: torch.Tensor, xi_norm: torch.Tensor, err: torch.Tensor) -> torch.Tensor:
-        return self.mlp(torch.cat([feat, goal * self.goal_scale, xi_norm, err], dim=-1)).squeeze(-1)
+        x = self._inputs(feat, goal, xi_norm, err)
+        return self.mlp(self.norm(x) if self.norm is not None else x).squeeze(-1)

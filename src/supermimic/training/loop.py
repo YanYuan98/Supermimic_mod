@@ -79,6 +79,7 @@ class Trainer:
                 goal_features=cfg.env.goal_features,
                 self_collision=cfg.env.self_collision,
                 seed=cfg.seed + 1000 * self.rank,
+                extra_command_kwargs=self._sampler_kwargs(cfg),
             ),
             device=self.device,
         )
@@ -114,6 +115,15 @@ class Trainer:
         self._t_start: float | None = None
         if cfg.resume is not None:
             self.load(cfg.resume)
+
+    @staticmethod
+    def _sampler_kwargs(cfg: TrainConfig) -> dict:
+        kw = {"sampler_init": cfg.env.sampler_init, "sampler_credit": cfg.env.sampler_credit}
+        if cfg.env.sampler_ema_alpha is not None:
+            kw["ema_alpha"] = cfg.env.sampler_ema_alpha
+        if cfg.env.sampler_memory_alpha is not None:
+            kw["memory_alpha"] = cfg.env.sampler_memory_alpha
+        return kw
 
     # ------------------------------------------------------------------ checkpoints
 

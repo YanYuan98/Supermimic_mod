@@ -67,7 +67,12 @@ class MultiClipMotionCommand(CommandTerm):
         self.body_quat_relative_w[:, :, 0] = 1.0
 
         # Return-based reset sampling state.
-        self.bin_return = torch.full((lib.num_bins,), cfg.g_max, device=self.device)
+        # v5 ablation E1: unvisited bins start at G_max (treated as easy) or 0 (hardest, visited first; vibed).
+        if cfg.sampler_init not in ("gmax", "zero"):
+            raise ValueError(f"unknown sampler_init {cfg.sampler_init!r}")
+        if cfg.sampler_credit not in ("per_step", "start_bin"):
+            raise ValueError(f"unknown sampler_credit {cfg.sampler_credit!r}")
+        self.bin_return = torch.full((lib.num_bins,), cfg.g_max if cfg.sampler_init == "gmax" else 0.0, device=self.device)
         self.bin_memory = torch.full((lib.num_bins,), 1.0 / lib.num_bins, device=self.device)
         self.max_ep_steps = min(int(math.ceil(env.cfg.episode_length_s / env.step_dt)) + 2, cfg.max_logged_steps)
         # Evaluation hook: when >= 0, the next reset of that env starts exactly at this global frame.
@@ -222,6 +227,9 @@ class MultiClipMotionCommand(CommandTerm):
         # Truncated (timed-out) episodes: bootstrap with the critic if available, otherwise
         # drop the steps too close to the truncation point (plan D14).
         terminated = self._env.termination_manager.terminated[env_ids] if hasattr(self._env, "termination_manager") else torch.ones_like(lens, dtype=torch.bool)
+        if cfg.sampler_credit == "start_bin":
+            self._finalize_start_bin(env_ids, lens, rtg, r, bins, terminated)
+            return
         truncated = ~terminated & ~self.clip_end[env_ids]
         if truncated.any():
             if self.bootstrap_fn is not None:
@@ -241,6 +249,27 @@ class MultiClipMotionCommand(CommandTerm):
         touched = cnts > 0
         mean = sums[touched] / cnts[touched]
         self.bin_return[touched] = (1 - cfg.ema_alpha) * self.bin_return[touched] + cfg.ema_alpha * mean
+        self.metrics["episode_return_to_go"][env_ids] = rtg[:, 0].float()
+        self.ep_len[env_ids] = 0
+
+    def _finalize_start_bin(self, env_ids, lens, rtg, r, bins, terminated) -> None:
+        """v5 ablation E2 (supermimic_vibed's bookkeeping): the whole episode's discounted return goes to
+        its start bin only; episodes that did not terminate (time-out or clip end) bootstrap with their
+        mean reward, gamma^T * mean_r / (1 - gamma)."""
+        cfg = self.cfg
+        ok = lens > 0
+        T = lens.clamp_min(1).double()
+        G = rtg[:, 0]
+        mean_r = r.sum(1) / T
+        boot = torch.where(terminated, torch.zeros_like(G), (cfg.gamma ** T) * mean_r / (1.0 - cfg.gamma))
+        G = (G + boot).float()[ok]
+        b = bins[:, 0][ok]
+        if b.numel() > 0:
+            sums = torch.zeros(self.library.num_bins, device=self.device).index_add_(0, b, G)
+            cnts = torch.zeros(self.library.num_bins, device=self.device).index_add_(0, b, torch.ones_like(G))
+            touched = cnts > 0
+            mean = sums[touched] / cnts[touched]
+            self.bin_return[touched] = (1 - cfg.ema_alpha) * self.bin_return[touched] + cfg.ema_alpha * mean
         self.metrics["episode_return_to_go"][env_ids] = rtg[:, 0].float()
         self.ep_len[env_ids] = 0
 
@@ -418,6 +447,8 @@ class MultiClipMotionCommandCfg(CommandTermCfg):
     ema_alpha: float = 0.05
     memory_alpha: float = 0.01
     min_remaining_steps: int = 100
+    sampler_init: str = "gmax"  # v5 E1: "gmax" | "zero"
+    sampler_credit: str = "per_step"  # v5 E2: "per_step" | "start_bin"
     max_logged_steps: int = 1024
     compact_library: bool = False
     library_fp16: bool = True

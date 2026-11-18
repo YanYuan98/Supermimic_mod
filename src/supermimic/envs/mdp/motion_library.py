@@ -231,6 +231,8 @@ class MotionLibrary:
         last = self.last_frame_of(frame)
         offs = torch.arange(k, device=self.device)
         idx = torch.minimum(frame[:, None] + offs[None, :], last[:, None])  # (N,k)
+        if mode == "vibed":
+            return self._goal_window_vibed(frame, idx).reshape(n, -1)
         if not self.compact:
             feat = self.goal_feat[idx]
         else:
@@ -245,6 +247,24 @@ class MotionLibrary:
         elif mode != "v1":
             raise ValueError(f"unknown goal feature mode {mode!r}")
         return feat.reshape(n, -1)
+
+    def _goal_window_vibed(self, frame: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        """supermimic_vibed's goal (v5 ablation F1), 73-d per frame: the window frames (target frame
+        onwards) relative to the reference frame of the *current state* (target frame - 1, held at the
+        clip start): [root displacement in its heading frame (3), root rotation in its heading frame
+        (rot6d, 6), root linear / angular velocity in the frame's own root frame (3 + 3), joint
+        positions (29, absolute), 0.1 * joint velocities (29)]."""
+        n, k = idx.shape
+        cur = torch.maximum(frame - 1, self.clip_start[self.frame_clip[frame]])
+        win = self._ref[idx].to(self.dtype)  # (N,k,71)
+        c = self._ref[cur].to(self.dtype)  # (N,71)
+        h = yaw_quat(c[:, 3:7])[:, None, :].expand(n, k, 4)
+        dp = quat_apply_inverse(h, win[..., 0:3] - c[:, None, 0:3])
+        rot = rot6d_from_quat(quat_mul(quat_inv(h), win[..., 3:7]))
+        q = win[..., 3:7]
+        v_b = quat_apply_inverse(q, win[..., 36:39])
+        w_b = quat_apply_inverse(q, win[..., 39:42])
+        return torch.cat([dp, rot, v_b, w_b, win[..., 7:36], 0.1 * win[..., 42:71]], dim=-1)
 
     def ref_qpos_qvel(self, frame: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """MuJoCo-layout reference state: qpos (N,36) and qvel (N,35; root ang vel in body frame)."""

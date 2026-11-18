@@ -28,6 +28,11 @@ class WorldModelCfg:
     layer_norm: bool = True
     termination: str = "analytic"
     term_softness: tuple[float, float] = (0.02, 0.04)  # analytic head: sigmoid widths for height [m] and tilt
+    # v5 ablation A1: "nominal" (state error / fixed nominal scales, summed over dims, averaged over k) or
+    # "delta_std" (supermimic_vibed: frame-local error / max(running std of the one-step increment, floor),
+    # averaged over dims, summed over k).
+    loss_weighting: str = "nominal"
+    delta_std_floor: tuple[float, ...] = (3e-3, 5e-3, 2e-2, 5e-2, 3e-3, 5e-2)  # [pos, rot, lin vel, ang vel, q, qd]
 
 
 class TerminationHead(nn.Module):
@@ -60,11 +65,19 @@ class WorldModel(nn.Module):
             raise ValueError(f"unknown world-model normalization {cfg.normalization!r}")
         if cfg.termination not in ("learned", "analytic"):
             raise ValueError(f"unknown termination head {cfg.termination!r}")
+        if cfg.loss_weighting not in ("nominal", "delta_std"):
+            raise ValueError(f"unknown world-model loss weighting {cfg.loss_weighting!r}")
+        self.delta_std = cfg.loss_weighting == "delta_std"
+        if self.delta_std:
+            self.inc_norm = RunningNorm(70, eps=1e-4)  # one-step increments in the local error layout
+            self.register_buffer("inc_floor", torch.cat([torch.full((n,), float(f)) for f, n in zip(cfg.delta_std_floor, (3, 3, 3, 3, 29, 29))]))
         self.to(device)
 
     @torch.no_grad()
     def update_normalizers(self, s: torch.Tensor, action: torch.Tensor, xi: torch.Tensor, s_next: torch.Tensor) -> None:
         """Feed logged transitions (s, a_exec, xi, s') to the running normalisers (no-op for "fixed")."""
+        if self.delta_std:
+            self.inc_norm.update(self.spec.local_error(s_next, s))
         if not self.running_norm:
             return
         x = torch.cat([self.spec.canonical(s), action, self.spec.normalize_xi(xi)], dim=-1)
@@ -104,18 +117,25 @@ class WorldModel(nn.Module):
         s = states[0]
         total_state = total_term = acc = 0.0
         nse = []
+        if self.delta_std:
+            std = torch.maximum(self.inc_norm.std(), self.inc_floor)
         for j in range(k):
             s = self.step(s, a_exec[j], xi)
             e = self.spec.error_vector(s, states[j + 1])
             sq = e * e
             feats = self.heads.termination_features(s[..., 0:3], s[..., 3:7], ReferenceFrame(None, None, None, None, ref_root_pos[j], ref_root_quat[j]))
             logits = self._term_logits_from_features(feats)
-            total_state = total_state + sq.sum(-1).mean()
+            if self.delta_std:
+                el = self.spec.local_error(s, states[j + 1]) / std
+                total_state = total_state + (el * el).mean(-1).mean()
+            else:
+                total_state = total_state + sq.sum(-1).mean()
             total_term = total_term + F.binary_cross_entropy_with_logits(logits, done[j])
-            nse.append(sq.detach().mean())
+            nse.append(sq.detach().mean())  # nominal-scale error in both modes (comparable across runs)
             acc = acc + ((logits.detach() > 0).float() == done[j]).float().mean()
-        loss = total_state / k + self.cfg.term_loss_weight * total_term / k
-        return loss, (total_state / k).detach(), (total_term / k).detach(), nse[0], nse[-1], acc / k
+        state_loss = total_state if self.delta_std else total_state / k
+        loss = state_loss + self.cfg.term_loss_weight * total_term / k
+        return loss, state_loss.detach(), (total_term / k).detach(), nse[0], nse[-1], acc / k
 
     def enable_compile(self, mode: str | None = "default") -> None:
         self._window_fn = torch.compile(self._window, mode=None if mode == "default" else mode, dynamic=False) if mode else self._window

@@ -64,6 +64,8 @@ def anchor_relative_obs(robot_anchor_pos: torch.Tensor, robot_anchor_quat: torch
 
 # Critic-only privileged tracking errors (F5): root error 4 + anchor pose 9 + body positions 14*3 + joints 29.
 CRITIC_ERR_DIM = 4 + 9 + 14 * 3 + 29
+# supermimic_vibed's critic error features (pelvis-anchored): joints 29 + bodies 14*3 + root 3 + rel. orientation 6.
+CRITIC_ERR_DIM_VIBED = 29 + 14 * 3 + 3 + 6
 
 
 def flatten_history_term_major(hist: torch.Tensor) -> torch.Tensor:
@@ -106,6 +108,7 @@ class AnalyticHeads:
         self.fk = fk
         self.tracked_idx = fk.body_indices(tracked_body_names)
         self.anchor_index = tracked_body_names.index(anchor_body_name)
+        self.tracked_root_index = tracked_body_names.index(root_body_name)
         self.root_fk_index = fk.body_index(root_body_name)
         self.soft_limits = soft_limits
         self.default_joint_pos = default_joint_pos
@@ -171,6 +174,23 @@ class AnalyticHeads:
         e_anchor = anchor_relative_obs(ra_pos, ra_quat, ma_pos, ma_quat, "pos_ori")
         e_joint = ref.joint_pos - s[..., 7:36]
         return torch.cat([self.root_error_features(s, ref), e_anchor, e_body, e_joint], dim=-1)
+
+    def critic_error_features_vibed(self, s: torch.Tensor, ref: ReferenceFrame, bodies=None) -> torch.Tensor:
+        """supermimic_vibed's ``MDP.critic_features`` error part (N, 80), anchored at the pelvis (the
+        free-joint root): [reference minus robot joint positions (29), pelvis-re-anchored reference body
+        positions minus robot body positions in the robot heading frame (42), reference minus robot root
+        position in the robot heading frame (3), reference root orientation in the robot root frame (rot6d, 6)]."""
+        b = bodies if bodies is not None else self.robot_bodies(s)
+        ri = self.tracked_root_index
+        rp, rq = s[..., 0:3], s[..., 3:7]  # robot pelvis = free-joint root
+        mp, mq = ref.body_pos_w[..., ri, :], ref.body_quat_w[..., ri, :]
+        rel_pos, _ = reanchor_reference(ref.body_pos_w, ref.body_quat_w, mp, mq, rp, rq)
+        nb = rel_pos.shape[-2]
+        hq = yaw_quat(rq)
+        e_body = quat_apply_inverse(hq[..., None, :].expand(*rq.shape[:-1], nb, 4), rel_pos - b["pos"]).reshape(*rp.shape[:-1], nb * 3)
+        e_root = quat_apply_inverse(hq, ref.root_pos_w - rp)
+        rel = anchor_relative_obs(rp, rq, ref.root_pos_w, ref.root_quat_w, "ori")
+        return torch.cat([ref.joint_pos - s[..., 7:36], e_body, e_root, rel], dim=-1)
 
     @staticmethod
     def root_error_features(s: torch.Tensor, ref: ReferenceFrame) -> torch.Tensor:

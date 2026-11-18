@@ -41,6 +41,13 @@ class EnvCfg:
     goal_features: str = "traj"
     # supermimic_vibed option: False drops robot self-collisions (feet / body vs ground only).
     self_collision: bool = False
+    # v5 ablations of the return-based reset sampler (E1/E2): initial value of unvisited bins
+    # ("gmax" | "zero") and credit assignment ("per_step" return-to-go into every visited bin, or
+    # "start_bin": whole-episode return into the start bin, mean-reward bootstrap). None = command default.
+    sampler_init: str = "gmax"
+    sampler_credit: str = "per_step"
+    sampler_ema_alpha: float | None = None
+    sampler_memory_alpha: float | None = None
 
 
 @dataclass
