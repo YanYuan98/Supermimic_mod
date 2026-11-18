@@ -14,3 +14,5 @@ wandb/
 .ruff_cache/
 experiments/**/outputs/
 docs/
+logs/
+
